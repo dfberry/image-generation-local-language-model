@@ -1,0 +1,36 @@
+version: 1.0
+name: sdxl-image-generation-api
+description: Containerized SDXL image generation API deployable to Azure Container Apps
+
+services:
+  api:
+    project: .
+    language: python
+    host: containerapp
+    dockerfile: Dockerfile
+    port: 8000
+
+metadata:
+  version: 1.0.0
+  description: SDXL Image Generation Flask API
+  author: dfberry
+
+infra:
+  path: infra
+  template: main.bicep
+  parameters: infra/parameters.json
+
+hooks:
+  predeploy:
+    shell: sh
+    continueOnError: false
+    run: |
+      echo "Building Docker image..."
+      docker build -t ${AZURE_CONTAINER_REGISTRY_ENDPOINT}/sdxl-api:latest .
+      echo "Docker image built successfully"
+  postdeploy:
+    shell: sh
+    continueOnError: true
+    run: |
+      echo "SDXL API deployed successfully"
+      echo "Service URL: https://${CONTAINER_APP_FQDN}"
