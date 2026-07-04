@@ -1,0 +1,54 @@
+# SDXL Image Generation — Docker Compose
+#
+# Default service (img-gen): CLI batch runner on CPU.
+#   Build:  docker compose build
+#   Run:    docker compose run --rm img-gen --batch-file /data/batch.json
+#
+# Optional HTTP server (img-gen-server, profile-gated):
+#   Start:  docker compose --profile server up
+#   Stop:   docker compose --profile server down
+#
+# Named volume hf-cache persists the model between runs (~7 GB, downloaded once).
+# On first run the model downloads automatically; every subsequent run loads from cache.
+
+services:
+  img-gen:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    working_dir: /data
+    volumes:
+      # Bind-mount the current directory so batch files and outputs are visible on the host.
+      - ./:/data:rw
+      # Persistent model cache — downloaded once, reused on every subsequent run.
+      - hf-cache:/root/.cache/huggingface
+    # entrypoint and default CMD are set in Dockerfile.cpu:
+    #   ENTRYPOINT ["python", "-m", "image_generation.generate"]
+    #   CMD ["--help"]
+    #
+    # Example:
+    #   docker compose run --rm img-gen --batch-file /data/batch.json
+
+  img-gen-server:
+    # Optional HTTP server — exposes POST /generate (same pipeline as the CLI).
+    # Only starts when the "server" profile is active:
+    #   docker compose --profile server up
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    profiles:
+      - server
+    entrypoint: ["python", "app.py"]
+    working_dir: /app
+    ports:
+      - "8000:8000"
+    volumes:
+      # Shares the same model cache as img-gen so the model is not re-downloaded.
+      - hf-cache:/root/.cache/huggingface
+      - ./outputs:/app/outputs
+
+volumes:
+  # Named volume for the Hugging Face model cache.
+  # Lives at /root/.cache/huggingface (= HF_HOME) inside the container.
+  # Remove with: docker volume rm <project>_hf-cache   (forces fresh model download)
+  hf-cache:

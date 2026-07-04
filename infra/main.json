@@ -4,8 +4,8 @@
   "metadata": {
     "_generator": {
       "name": "bicep",
-      "version": "0.41.2.15936",
-      "templateHash": "13892018995717492843"
+      "version": "0.42.1.51946",
+      "templateHash": "5496158293699294638"
     }
   },
   "parameters": {
@@ -62,8 +62,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.41.2.15936",
-              "templateHash": "6717042160696540461"
+              "version": "0.42.1.51946",
+              "templateHash": "12969267115588112558"
             }
           },
           "parameters": {
@@ -102,6 +102,105 @@
             "registryName": {
               "type": "string",
               "value": "[parameters('containerRegistryName')]"
+            },
+            "adminUsername": {
+              "type": "string",
+              "value": "[listCredentials(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').username]"
+            },
+            "adminPassword": {
+              "type": "string",
+              "value": "[listCredentials(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').passwords[0].value]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "storage-deployment",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.42.1.51946",
+              "templateHash": "16501179816439079334"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "defaultValue": "[resourceGroup().location]"
+            },
+            "storageAccountName": {
+              "type": "string",
+              "defaultValue": "[format('sdxlmodels{0}', uniqueString(resourceGroup().id))]"
+            },
+            "fileShareName": {
+              "type": "string",
+              "defaultValue": "huggingface-models"
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Storage/storageAccounts",
+              "apiVersion": "2023-01-01",
+              "name": "[parameters('storageAccountName')]",
+              "location": "[parameters('location')]",
+              "sku": {
+                "name": "Standard_LRS"
+              },
+              "kind": "StorageV2",
+              "properties": {
+                "minimumTlsVersion": "TLS1_2",
+                "supportsHttpsTrafficOnly": true,
+                "allowBlobPublicAccess": false
+              }
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/fileServices",
+              "apiVersion": "2023-01-01",
+              "name": "[format('{0}/{1}', parameters('storageAccountName'), 'default')]",
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/fileServices/shares",
+              "apiVersion": "2023-01-01",
+              "name": "[format('{0}/{1}/{2}', parameters('storageAccountName'), 'default', parameters('fileShareName'))]",
+              "properties": {
+                "shareQuota": 100
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/fileServices', parameters('storageAccountName'), 'default')]"
+              ]
+            }
+          ],
+          "outputs": {
+            "storageAccountName": {
+              "type": "string",
+              "value": "[parameters('storageAccountName')]"
+            },
+            "storageAccountKey": {
+              "type": "string",
+              "value": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), '2023-01-01').keys[0].value]"
+            },
+            "fileShareName": {
+              "type": "string",
+              "value": "[parameters('fileShareName')]"
             }
           }
         }
@@ -122,6 +221,15 @@
           },
           "environmentName": {
             "value": "[parameters('environmentName')]"
+          },
+          "storageAccountName": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storage-deployment'), '2025-04-01').outputs.storageAccountName.value]"
+          },
+          "storageAccountKey": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storage-deployment'), '2025-04-01').outputs.storageAccountKey.value]"
+          },
+          "fileShareName": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storage-deployment'), '2025-04-01').outputs.fileShareName.value]"
           }
         },
         "template": {
@@ -130,8 +238,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.41.2.15936",
-              "templateHash": "11573025209438501766"
+              "version": "0.42.1.51946",
+              "templateHash": "16785052895041059423"
             }
           },
           "parameters": {
@@ -141,23 +249,79 @@
             },
             "environmentName": {
               "type": "string"
+            },
+            "storageAccountName": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "storageAccountKey": {
+              "type": "securestring",
+              "defaultValue": ""
+            },
+            "fileShareName": {
+              "type": "string",
+              "defaultValue": "huggingface-models"
             }
           },
           "resources": [
+            {
+              "type": "Microsoft.OperationalInsights/workspaces",
+              "apiVersion": "2021-12-01-preview",
+              "name": "[format('{0}-logs', parameters('environmentName'))]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "sku": {
+                  "name": "PerGB2018"
+                },
+                "retentionInDays": 30
+              }
+            },
             {
               "type": "Microsoft.App/managedEnvironments",
               "apiVersion": "2023-05-01",
               "name": "[parameters('environmentName')]",
               "location": "[parameters('location')]",
               "properties": {
+                "workloadProfiles": [
+                  {
+                    "name": "Consumption",
+                    "workloadProfileType": "Consumption"
+                  },
+                  {
+                    "name": "sdxl-profile",
+                    "workloadProfileType": "D4",
+                    "minimumCount": 0,
+                    "maximumCount": 1
+                  }
+                ],
                 "appLogsConfiguration": {
                   "destination": "log-analytics",
                   "logAnalyticsConfiguration": {
-                    "customerId": "",
-                    "sharedKey": ""
+                    "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', format('{0}-logs', parameters('environmentName'))), '2021-12-01-preview').customerId]",
+                    "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', format('{0}-logs', parameters('environmentName'))), '2021-12-01-preview').primarySharedKey]"
                   }
                 }
-              }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.OperationalInsights/workspaces', format('{0}-logs', parameters('environmentName')))]"
+              ]
+            },
+            {
+              "condition": "[not(empty(parameters('storageAccountName')))]",
+              "type": "Microsoft.App/managedEnvironments/storages",
+              "apiVersion": "2023-05-01",
+              "name": "[format('{0}/{1}', parameters('environmentName'), 'models-storage')]",
+              "properties": {
+                "azureFile": {
+                  "accountName": "[parameters('storageAccountName')]",
+                  "accountKey": "[parameters('storageAccountKey')]",
+                  "shareName": "[parameters('fileShareName')]",
+                  "accessMode": "ReadWrite"
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.App/managedEnvironments', parameters('environmentName'))]"
+              ]
             }
           ],
           "outputs": {
@@ -168,10 +332,21 @@
             "environmentName": {
               "type": "string",
               "value": "[parameters('environmentName')]"
+            },
+            "logAnalyticsWorkspaceId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.OperationalInsights/workspaces', format('{0}-logs', parameters('environmentName')))]"
+            },
+            "workloadProfileName": {
+              "type": "string",
+              "value": "sdxl-profile"
             }
           }
         }
-      }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'storage-deployment')]"
+      ]
     },
     {
       "type": "Microsoft.Resources/deployments",
@@ -198,8 +373,20 @@
           "containerRegistryUrl": {
             "value": "[variables('acrUrl')]"
           },
+          "containerRegistryPassword": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'acr-deployment'), '2025-04-01').outputs.adminPassword.value]"
+          },
           "containerRegistryUsername": {
-            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'acr-deployment'), '2025-04-01').outputs.loginServer.value]"
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'acr-deployment'), '2025-04-01').outputs.adminUsername.value]"
+          },
+          "storageAccountName": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storage-deployment'), '2025-04-01').outputs.storageAccountName.value]"
+          },
+          "storageAccountKey": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storage-deployment'), '2025-04-01').outputs.storageAccountKey.value]"
+          },
+          "workloadProfileName": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'aca-env-deployment'), '2025-04-01').outputs.workloadProfileName.value]"
           }
         },
         "template": {
@@ -208,8 +395,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.41.2.15936",
-              "templateHash": "8357662444333127872"
+              "version": "0.42.1.51946",
+              "templateHash": "1426463540839149306"
             }
           },
           "parameters": {
@@ -229,12 +416,25 @@
             "containerRegistryUrl": {
               "type": "string"
             },
-            "containerRegistryUsername": {
-              "type": "string"
-            },
             "containerRegistryPassword": {
               "type": "securestring",
               "defaultValue": ""
+            },
+            "containerRegistryUsername": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "storageAccountName": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "storageAccountKey": {
+              "type": "securestring",
+              "defaultValue": ""
+            },
+            "workloadProfileName": {
+              "type": "string",
+              "defaultValue": "sdxl-profile"
             }
           },
           "resources": [
@@ -244,6 +444,7 @@
               "name": "[parameters('containerAppName')]",
               "location": "[parameters('location')]",
               "properties": {
+                "workloadProfileName": "[parameters('workloadProfileName')]",
                 "environmentId": "[parameters('containerAppsEnvironmentId')]",
                 "configuration": {
                   "ingress": {
@@ -253,7 +454,10 @@
                     "allowInsecure": false
                   },
                   "registries": "[if(not(empty(parameters('containerRegistryPassword'))), createArray(createObject('server', parameters('containerRegistryUrl'), 'username', parameters('containerRegistryUsername'), 'passwordSecretRef', 'registry-password')), createArray())]",
-                  "secrets": "[if(not(empty(parameters('containerRegistryPassword'))), createArray(createObject('name', 'registry-password', 'value', parameters('containerRegistryPassword'))), createArray())]"
+                  "secrets": "[concat(if(not(empty(parameters('containerRegistryPassword'))), createArray(createObject('name', 'registry-password', 'value', parameters('containerRegistryPassword'))), createArray()), if(not(empty(parameters('storageAccountKey'))), createArray(createObject('name', 'storage-account-key', 'value', parameters('storageAccountKey'))), createArray()))]",
+                  "dapr": {
+                    "enabled": false
+                  }
                 },
                 "template": {
                   "containers": [
@@ -262,8 +466,7 @@
                       "image": "[parameters('imageName')]",
                       "resources": {
                         "cpu": "[json('4')]",
-                        "memory": "16Gi",
-                        "ephemeralStorage": "1Gi"
+                        "memory": "16Gi"
                       },
                       "env": [
                         {
@@ -271,6 +474,7 @@
                           "value": "8000"
                         }
                       ],
+                      "volumeMounts": "[if(not(empty(parameters('storageAccountName'))), createArray(createObject('volumeName', 'models-cache', 'mountPath', '/root/.cache/huggingface')), createArray())]",
                       "probes": [
                         {
                           "type": "Liveness",
@@ -293,6 +497,7 @@
                       ]
                     }
                   ],
+                  "volumes": "[if(not(empty(parameters('storageAccountName'))), createArray(createObject('name', 'models-cache', 'storageType', 'AzureFile', 'storageName', 'models-storage')), createArray())]",
                   "scale": {
                     "minReplicas": 0,
                     "maxReplicas": 1
@@ -319,7 +524,8 @@
       },
       "dependsOn": [
         "[resourceId('Microsoft.Resources/deployments', 'acr-deployment')]",
-        "[resourceId('Microsoft.Resources/deployments', 'aca-env-deployment')]"
+        "[resourceId('Microsoft.Resources/deployments', 'aca-env-deployment')]",
+        "[resourceId('Microsoft.Resources/deployments', 'storage-deployment')]"
       ]
     }
   ],

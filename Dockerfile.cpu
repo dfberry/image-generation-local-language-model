@@ -1,0 +1,48 @@
+# CPU-only CLI image — no GPU required, no model baked in.
+# Model downloads on first run into a persistent cache volume (download once, reuse every run).
+# Usage (via docker compose — recommended):
+#   docker compose build
+#   docker compose run --rm img-gen --batch-file /data/batch.json
+# Direct build:
+#   docker build -f Dockerfile.cpu -t sdxl-cli:cpu .
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/app/src \
+    HF_HOME=/root/.cache/huggingface
+
+# System libraries required by opencv / invisible-watermark and image I/O
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install CPU-only torch first (avoids pulling multi-GB CUDA wheels),
+# then the remaining requirements (torch is already satisfied so it is not reinstalled).
+COPY requirements.txt .
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.6.0" && \
+    pip install -r requirements.txt
+
+# Copy application code
+COPY app.py .
+COPY src/ ./src/
+
+# /data is the working directory for batch files and outputs.
+# Mount the host directory here: docker run --mount type=bind,source=$(pwd),target=/data ...
+# The hf-cache named volume is mounted at HF_HOME so the model is downloaded once and reused.
+WORKDIR /data
+VOLUME ["/data"]
+
+ENTRYPOINT ["python", "-m", "image_generation.generate"]
+CMD ["--help"]

@@ -65,3 +65,6 @@ generation.log
 tmp/
 temp/
 *.tmp
+
+# Squad state (belongs to the hub repo, not this app repo)
+decisions/

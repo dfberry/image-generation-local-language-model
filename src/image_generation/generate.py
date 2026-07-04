@@ -3,7 +3,15 @@
 Stable Diffusion XL image generation script.
 Uses SDXL Base 1.0 with optional refiner for high-quality output.
 
-Model: stabilityai/stable-diffusion-xl-base-1.0
+Default model: stabilityai/stable-diffusion-xl-base-1.0 (SDXL architecture).
+Configurable via environment variables:
+  SDXL_BASE_MODEL     — HF repo id or local path for the base model (default: SDXL 1.0)
+  SDXL_REFINER_MODEL  — HF repo id or local path for the refiner (default: SDXL refiner 1.0)
+  SDXL_MODEL_REVISION — optional git revision / branch passed to from_pretrained (default: latest)
+
+NOTE: The refiner shares VAE + text_encoder_2 with the base pipeline.
+Swapping models requires a compatible SDXL-architecture refiner.
+Non-SDXL architectures (SD 1.5, SD3, Flux …) need code changes.
 License: CreativeML Open RAIL++-M
 """
 
@@ -17,6 +25,27 @@ from types import SimpleNamespace
 
 import torch
 from diffusers import DiffusionPipeline
+
+# ---------------------------------------------------------------------------
+# Model configuration — override via environment variables before process start.
+# The model is NOT baked into the image; it downloads on first run into the HF
+# cache (default /root/.cache/huggingface, or $HF_HOME/hub).  Mount a persistent
+# volume at that path so the ~7 GB download only happens once.
+#
+# SDXL architecture assumption: the refiner shares VAE + text_encoder_2 with
+# the base pipeline.  Safe to swap in any SDXL-compatible checkpoint.
+# A non-SDXL architecture (SD 1.5, SD3, Flux …) breaks the refiner path and
+# may conflict with the 1024 px defaults and the 80/20 step-split; those
+# paths would need code changes before a cross-architecture swap is safe.
+# ---------------------------------------------------------------------------
+BASE_MODEL_ID = os.environ.get(
+    "SDXL_BASE_MODEL", "stabilityai/stable-diffusion-xl-base-1.0"
+)
+REFINER_MODEL_ID = os.environ.get(
+    "SDXL_REFINER_MODEL", "stabilityai/stable-diffusion-xl-refiner-1.0"
+)
+# None → from_pretrained uses the default branch (main / latest).
+MODEL_REVISION = os.environ.get("SDXL_MODEL_REVISION") or None
 
 
 class OOMError(RuntimeError):
@@ -39,6 +68,8 @@ def parse_args():
     parser.add_argument("--width", type=int, default=1024, help="Image width in pixels")
     parser.add_argument("--height", type=int, default=1024, help="Image height in pixels")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--negative-prompt", dest="negative_prompt", default=None,
+                        help="Negative prompt (things to avoid in the image)")
     parser.add_argument("--refine", action="store_true", help="Use base + refiner pipeline (higher quality)")
     parser.add_argument("--cpu", action="store_true", help="Force CPU mode (slow, no GPU required)")
     return parser.parse_args()
@@ -65,20 +96,32 @@ def get_dtype(device: str):
 
 def load_base(device: str) -> DiffusionPipeline:
     """Load SDXL base model."""
-    print("📥 Loading SDXL base model (first run downloads ~7GB)...")
+    print(f"📥 Loading base model ({BASE_MODEL_ID}) — first run downloads ~7 GB into the HF cache; subsequent runs reuse the cached weights...")
     dtype = get_dtype(device)
     pipe = DiffusionPipeline.from_pretrained(
-        "stabilityai/stable-diffusion-xl-base-1.0",
+        BASE_MODEL_ID,
         torch_dtype=dtype,
         use_safetensors=True,
+        revision=MODEL_REVISION,
         # fp16 variant available for CUDA and MPS
         variant="fp16" if device in ("cuda", "mps") else None,
     )
-    if device in ("cpu", "mps"):
-        # CPU offload reduces VRAM pressure; MPS benefits too
+    if device == "mps":
+        # MPS is a real accelerator; offload keeps peak VRAM low
         pipe.enable_model_cpu_offload()
     else:
+        # cpu: to("cpu") — enable_model_cpu_offload() requires CUDA/MPS and raises on pure CPU
+        # cuda: to(device) — standard GPU placement
         pipe.to(device)
+
+    # CPU memory optimisations: slice attention and VAE in chunks to avoid
+    # the large intermediate tensors that cause exit-139 OOM on CPU-only
+    # systems (including Docker Desktop / WSL2 with the default 8 GB cap).
+    # These have no effect on CUDA/MPS paths.
+    if device == "cpu":
+        pipe.enable_attention_slicing("max")
+        pipe.enable_vae_slicing()
+        pipe.enable_vae_tiling()
 
     # torch.compile gives ~20-30% speedup on CUDA with torch >= 2.0
     if device == "cuda" and hasattr(torch, "compile"):
@@ -90,27 +133,38 @@ def load_base(device: str) -> DiffusionPipeline:
 
 def load_refiner(text_encoder_2, vae, device: str) -> DiffusionPipeline:
     """Load SDXL refiner, sharing text encoder and VAE from base."""
-    print("📥 Loading SDXL refiner model...")
+    print(f"📥 Loading refiner model ({REFINER_MODEL_ID})...")
     dtype = get_dtype(device)
     refiner = DiffusionPipeline.from_pretrained(
-        "stabilityai/stable-diffusion-xl-refiner-1.0",
+        REFINER_MODEL_ID,
         # Share components with base to save VRAM
         text_encoder_2=text_encoder_2,
         vae=vae,
         torch_dtype=dtype,
         use_safetensors=True,
+        revision=MODEL_REVISION,
         variant="fp16" if device in ("cuda", "mps") else None,
     )
-    if device in ("cpu", "mps"):
+    if device == "mps":
         refiner.enable_model_cpu_offload()
     else:
+        # cpu: to("cpu") — same guard as load_base (offload requires CUDA/MPS)
+        # cuda: to(device)
         refiner.to(device)
+
+    # Same CPU slicing applied to the refiner pipeline (see load_base comment).
+    if device == "cpu":
+        refiner.enable_attention_slicing("max")
+        refiner.enable_vae_slicing()
+        refiner.enable_vae_tiling()
+
     return refiner
 
 
 def generate(args) -> str:
     """Run image generation and save to output path."""
     device = get_device(args.cpu)
+    negative_prompt = getattr(args, 'negative_prompt', None)
 
     # Fix 3: Pre-flight flush — reclaim any GPU memory from a prior generate()
     # call before loading new pipelines. Reduces OOM risk in back-to-back runs.
@@ -148,6 +202,7 @@ def generate(args) -> str:
             # Stage 1: base model produces latents
             latents = base(
                 prompt=args.prompt,
+                negative_prompt=negative_prompt,
                 num_inference_steps=args.steps,
                 guidance_scale=args.guidance,
                 width=args.width,
@@ -177,6 +232,7 @@ def generate(args) -> str:
             refiner = load_refiner(text_encoder_2, vae, device)
             image = refiner(
                 prompt=args.prompt,
+                negative_prompt=negative_prompt,
                 num_inference_steps=args.steps,
                 guidance_scale=args.guidance,
                 denoising_start=high_noise_frac,
@@ -189,6 +245,7 @@ def generate(args) -> str:
             base = load_base(device)
             image = base(
                 prompt=args.prompt,
+                negative_prompt=negative_prompt,
                 num_inference_steps=args.steps,
                 guidance_scale=args.guidance,
                 width=args.width,
@@ -229,43 +286,66 @@ def generate(args) -> str:
     return output_path
 
 
-def batch_generate(prompts: list[dict], device: str = "mps") -> list[dict]:
+def run_batch(
+    prompts: list[dict],
+    *,
+    steps: int = 40,
+    guidance: float = 7.5,
+    width: int = 1024,
+    height: int = 1024,
+    refine: bool = False,
+    cpu: bool = False,
+) -> list[dict]:
     """
-    Generate images for a list of prompt dicts, flushing GPU memory between items.
+    Canonical batch engine — used by both the CLI and the Flask server.
 
-    Each input dict: {"prompt": str, "output": str, "seed": int (optional)}
-    Returns list of {"prompt": str, "output": str, "status": "ok"|"error", "error": str|None}
+    Each input dict (reference format):
+        {"prompt": str, "output": str (optional), "negative_prompt": str (optional), "seed": int (optional)}
+
+    Global params (steps, guidance, width, height, refine, cpu) apply to every item.
+    Per-item "output", "seed", and "negative_prompt" override per-call.
+
+    Returns list of:
+        {"prompt": str, "output": str|None, "status": "ok"|"oom_error"|"error", "error": str|None}
     """
     results = []
     for i, item in enumerate(prompts):
         args = SimpleNamespace(
             prompt=item["prompt"],
-            output=item["output"],
+            negative_prompt=item.get("negative_prompt"),
+            output=item.get("output"),
             seed=item.get("seed"),
-            steps=40,
-            guidance=7.5,
-            width=1024,
-            height=1024,
-            refine=False,
-            cpu=(device == "cpu"),
+            steps=steps,
+            guidance=guidance,
+            width=width,
+            height=height,
+            refine=refine,
+            cpu=cpu,
         )
         try:
-            output_path = generate(args)
+            output_path = generate_with_retry(args)
             results.append({
                 "prompt": item["prompt"],
                 "output": output_path,
                 "status": "ok",
                 "error": None,
             })
+        except OOMError as exc:
+            results.append({
+                "prompt": item["prompt"],
+                "output": item.get("output"),
+                "status": "oom_error",
+                "error": str(exc),
+            })
         except Exception as exc:
             results.append({
                 "prompt": item["prompt"],
-                "output": item["output"],
+                "output": item.get("output"),
                 "status": "error",
                 "error": str(exc),
             })
 
-        # Flush GPU memory between items (not needed after the last item)
+        # Flush GPU memory between items (skip after the last item)
         if i < len(prompts) - 1:
             gc.collect()
             torch.cuda.empty_cache()
@@ -299,7 +379,7 @@ def main():
     args = parse_args()
     if hasattr(args, 'batch_file') and args.batch_file:
         try:
-            with open(args.batch_file) as f:
+            with open(args.batch_file, encoding="utf-8") as f:
                 prompts = json.load(f)
         except FileNotFoundError:
             print(f"Error: batch file not found: {args.batch_file}", file=sys.stderr)
@@ -307,11 +387,18 @@ def main():
         except json.JSONDecodeError as e:
             print(f"Error: invalid JSON in batch file: {e}", file=sys.stderr)
             sys.exit(1)
-        device = "cpu" if args.cpu else get_device(False)
-        results = batch_generate(prompts, device=device)
+        results = run_batch(
+            prompts,
+            steps=args.steps,
+            guidance=args.guidance,
+            width=args.width,
+            height=args.height,
+            refine=args.refine,
+            cpu=args.cpu,
+        )
         for r in results:
             status = r['status']
-            print(f"[{status}] {r['prompt'][:50]} → {r.get('output', r.get('error', ''))}")
+            print(f"[{status}] {r['prompt'][:50]} → {r.get('output') or r.get('error', '')}")
     else:
         generate_with_retry(args)
 

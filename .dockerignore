@@ -1,0 +1,35 @@
+# Build context exclusions — keep the context small and secrets out of layers.
+
+# Generated images
+outputs/
+
+# Version control
+.git
+.gitignore
+
+# Python byte-code and caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Hugging Face model caches (large; baked via RUN script, not COPY)
+.cache/
+*.cache
+
+# Editor / OS artefacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Infrastructure source (not needed inside the image)
+infra/
+
+# Test outputs and notebooks
+*.ipynb

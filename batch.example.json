@@ -1,0 +1,14 @@
+[
+  {
+    "output": "outputs/example-1.png",
+    "prompt": "a serene mountain lake at sunrise, golden light reflecting on calm water, photorealistic",
+    "negative_prompt": "blur, noise, oversaturated, cartoon, people",
+    "seed": 42
+  },
+  {
+    "output": "outputs/example-2.png",
+    "prompt": "a cozy coffee shop interior, warm lighting, books on shelves, empty chairs, soft morning light",
+    "negative_prompt": "people, crowded, dark, blurry",
+    "seed": 7
+  }
+]

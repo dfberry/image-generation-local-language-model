@@ -18,12 +18,23 @@ module acr 'resources/acr.bicep' = {
   }
 }
 
-// Create Container Apps Environment
+// Create Azure Files storage account for persistent HF model cache
+module storage 'resources/storage.bicep' = {
+  name: 'storage-deployment'
+  params: {
+    location: location
+  }
+}
+
+// Create Container Apps Environment (wires Azure Files share into the env as 'models-storage')
 module caEnvironment 'resources/aca-env.bicep' = {
   name: 'aca-env-deployment'
   params: {
     location: location
     environmentName: environmentName
+    storageAccountName: storage.outputs.storageAccountName
+    storageAccountKey: storage.outputs.storageAccountKey
+    fileShareName: storage.outputs.fileShareName
   }
 }
 
@@ -36,7 +47,11 @@ module containerApp 'resources/aca.bicep' = {
     containerAppsEnvironmentId: caEnvironment.outputs.environmentId
     imageName: fullImageName
     containerRegistryUrl: acrUrl
-    containerRegistryPassword: ''
+    containerRegistryPassword: acr.outputs.adminPassword
+    containerRegistryUsername: acr.outputs.adminUsername
+    storageAccountName: storage.outputs.storageAccountName
+    storageAccountKey: storage.outputs.storageAccountKey
+    workloadProfileName: caEnvironment.outputs.workloadProfileName
   }
 }
 

@@ -3,15 +3,19 @@ param containerAppName string
 param containerAppsEnvironmentId string
 param imageName string
 param containerRegistryUrl string
+@secure()
 param containerRegistryPassword string = ''
+param containerRegistryUsername string = ''
 param storageAccountName string = ''
+@secure()
 param storageAccountKey string = ''
-param fileShareName string = 'huggingface-models'
+param workloadProfileName string = 'sdxl-profile'
 
 resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
   name: containerAppName
   location: location
   properties: {
+    workloadProfileName: workloadProfileName
     environmentId: containerAppsEnvironmentId
     configuration: {
       ingress: {
@@ -19,12 +23,11 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
         targetPort: 8000
         transport: 'auto'
         allowInsecure: false
-        timeout: 120
       }
       registries: !empty(containerRegistryPassword) ? [
         {
           server: containerRegistryUrl
-          username: containerRegistryUrl
+          username: containerRegistryUsername
           passwordSecretRef: 'registry-password'
         }
       ] : []
@@ -42,7 +45,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
           }
         ] : []
       )
-      daprConfig: {
+      dapr: {
         enabled: false
       }
     }

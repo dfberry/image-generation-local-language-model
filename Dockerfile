@@ -1,18 +1,26 @@
-# Stage: runtime
-FROM nvidia/cuda:12.1-runtime-ubuntu22.04
+# GPU CLI image — requires NVIDIA GPU + NVIDIA Container Toolkit.
+# Model downloads on first run into a persistent cache volume (download once, reuse every run).
+# NOT for Windows devbox / WSL2 without GPU passthrough — use Dockerfile.cpu instead.
+# Usage (via docker compose — recommended):
+#   docker compose -f docker-compose.gpu.yml run --rm img-gen --batch-file /data/batch.json
+# Direct run (verify GPU first with: nvidia-smi):
+#   docker build -t sdxl-cli:gpu .
+#   docker run --gpus all --rm -v $(pwd):/data -v hf-cache:/root/.cache/huggingface sdxl-cli:gpu --batch-file /data/batch.json
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
 
-# Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/app/src \
+    HF_HOME=/root/.cache/huggingface
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y \
     python3.11 \
     python3-pip \
     python3-venv \
     git \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
@@ -20,10 +28,8 @@ RUN apt-get update && apt-get install -y \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Create app directory
 WORKDIR /app
 
-# Copy requirements and install Python dependencies
 COPY requirements.txt .
 RUN pip install --upgrade pip setuptools wheel && \
     pip install -r requirements.txt
@@ -32,15 +38,8 @@ RUN pip install --upgrade pip setuptools wheel && \
 COPY app.py .
 COPY src/ ./src/
 
-# Create output directory
-RUN mkdir -p /app/outputs
+WORKDIR /data
+VOLUME ["/data"]
 
-# Expose port
-EXPOSE 8000
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()" || exit 1
-
-# Run application
-CMD ["python3", "app.py"]
+ENTRYPOINT ["python3", "-m", "image_generation.generate"]
+CMD ["--help"]
