@@ -2,10 +2,11 @@
 # and save every returned image to disk.
 #
 # Usage:
-#   ./scripts/generate-cloud.ps1 -Url <container-app-root-url> -BatchFile <batch-file> [-OutputDir <output-dir>]
+#   ./scripts/generate-cloud.ps1 -Url <container-app-root-url> -BatchFile <batch-file> [-OutputDir <output-dir>] [-Warmup]
 #
 # Example:
 #   ./scripts/generate-cloud.ps1 -Url https://sdxl-generation-api.xxx.eastus.azurecontainerapps.io -BatchFile batch.json -OutputDir ./outputs
+#   ./scripts/generate-cloud.ps1 -Url https://sdxl-generation-api.xxx.eastus.azurecontainerapps.io -BatchFile batch.json -OutputDir ./outputs -Warmup
 
 param(
     [Parameter(Mandatory)]
@@ -14,13 +15,17 @@ param(
     [Parameter(Mandatory)]
     [string]$BatchFile,
 
-    [string]$OutputDir = "."
+    [string]$OutputDir = ".",
+
+    [switch]$Warmup
 )
 
 # ── normalize URL ─────────────────────────────────────────────────────────────
 $RootUrl     = $Url.TrimEnd('/')
 $GenerateUrl = "$RootUrl/generate"
 $HealthUrl   = "$RootUrl/health"
+$PullUrl     = "$RootUrl/model/pull"
+$StatusUrl   = "$RootUrl/model/status"
 
 # ── validate batch file ───────────────────────────────────────────────────────
 if (-not (Test-Path -LiteralPath $BatchFile -PathType Leaf)) {
@@ -56,6 +61,40 @@ for ($i = 1; $i -le $MaxAttempts; $i++) {
 
 if (-not $healthy) {
     Write-Warning "Container did not report healthy after $MaxAttempts attempts. Proceeding anyway..."
+}
+
+# ── warm-up (opt-in) ──────────────────────────────────────────────────────────
+if ($Warmup) {
+    Write-Host "Warm-up requested — pulling model..."
+    try {
+        Invoke-RestMethod -Uri $PullUrl -Method Post -TimeoutSec 30 | Out-Null
+    }
+    catch {
+        Write-Host "  /model/pull returned an error (may be non-fatal): $_"
+    }
+
+    $MaxWarmupAttempts = 60
+    $WarmupSleep       = 15
+    $warmedUp          = $false
+    for ($w = 1; $w -le $MaxWarmupAttempts; $w++) {
+        try {
+            $s = Invoke-RestMethod -Uri $StatusUrl -Method Get -TimeoutSec 10 -ErrorAction Stop
+            Write-Host "  Model state: $($s.state) (attempt $w/$MaxWarmupAttempts)"
+            if ($s.state -eq "ready") { $warmedUp = $true; break }
+            if ($s.state -eq "error") {
+                $errDetail = if ($s.error) { $s.error } else { "unknown error" }
+                Write-Error "Model warm-up failed: $errDetail"
+                exit 1
+            }
+        }
+        catch {
+            Write-Host "  Attempt $w/$MaxWarmupAttempts — status check failed: $_"
+        }
+        Start-Sleep -Seconds $WarmupSleep
+    }
+    if (-not $warmedUp) {
+        Write-Warning "Model did not reach 'ready' after $MaxWarmupAttempts attempts. Proceeding anyway..."
+    }
 }
 
 # ── POST to /generate ─────────────────────────────────────────────────────────

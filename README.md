@@ -873,6 +873,16 @@ Both scripts:
 4. For each `ok` result, base64-decode `image_base64` and write it to `<output-dir>/<filename>`.
 5. Print a `<N> saved, <M> failed` summary and exit non-zero if any image failed.
 
+**Warm-up flag (optional):** Pass `--warmup` (bash) or `-Warmup` (PowerShell) to pre-pull the model and wait until it reports `ready` before sending the batch. Useful right after an ACA scale-from-zero event to avoid the ~6-minute first-download delay hitting `/generate`. The scripts POST to `/model/pull`, then poll `/model/status` up to 60 times (15 s apart, ~15 min max); they exit with an error if the model enters an error state, or proceed anyway if the poll cap is reached.
+
+```bash
+./scripts/generate-cloud.sh --warmup https://<app-root> batch.json ./outputs
+```
+
+```powershell
+./scripts/generate-cloud.ps1 -Url https://<app-root> -BatchFile batch.json -OutputDir ./outputs -Warmup
+```
+
 > **bash note:** `jq` must be on `PATH`. Install with `brew install jq` (macOS) or `sudo apt-get install jq` (Ubuntu/Debian).
 
 ### Send the request

@@ -3,10 +3,11 @@
 # and save every returned image to disk.
 #
 # Usage:
-#   ./scripts/generate-cloud.sh <container-app-root-url> <batch-file> [output-dir]
+#   ./scripts/generate-cloud.sh [--warmup] <container-app-root-url> <batch-file> [output-dir]
 #
 # Example:
 #   ./scripts/generate-cloud.sh https://sdxl-generation-api.xxx.eastus.azurecontainerapps.io batch.json ./outputs
+#   ./scripts/generate-cloud.sh --warmup https://sdxl-generation-api.xxx.eastus.azurecontainerapps.io batch.json ./outputs
 
 set -euo pipefail
 
@@ -21,15 +22,29 @@ fi
 
 # ── usage ───────────────────────────────────────────────────────────────────
 usage() {
-  echo "Usage: $0 <container-app-root-url> <batch-file> [output-dir]" >&2
+  echo "Usage: $0 [--warmup] <container-app-root-url> <batch-file> [output-dir]" >&2
+  echo "  --warmup                Pre-pull the model and wait until ready before generating" >&2
   echo "  container-app-root-url  Root URL of the ACA app (no /generate suffix)" >&2
   echo "  batch-file              Path to a local JSON batch file" >&2
   echo "  output-dir              Directory to save images (default: .)" >&2
   echo "" >&2
   echo "Example:" >&2
   echo "  $0 https://sdxl-generation-api.xxx.eastus.azurecontainerapps.io batch.json ./outputs" >&2
+  echo "  $0 --warmup https://sdxl-generation-api.xxx.eastus.azurecontainerapps.io batch.json ./outputs" >&2
   exit 1
 }
+
+# ── parse flags ──────────────────────────────────────────────────────────────
+WARMUP=false
+POSITIONAL=()
+for arg in "$@"; do
+  if [[ "$arg" == "--warmup" ]]; then
+    WARMUP=true
+  else
+    POSITIONAL+=("$arg")
+  fi
+done
+set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
 
 [[ $# -lt 2 ]] && usage
 
@@ -40,6 +55,8 @@ OUTPUT_DIR="${3:-.}"
 
 GENERATE_URL="${RAW_URL}/generate"
 HEALTH_URL="${RAW_URL}/health"
+PULL_URL="${RAW_URL}/model/pull"
+STATUS_URL="${RAW_URL}/model/status"
 
 # ── validate batch file ──────────────────────────────────────────────────────
 if [[ ! -f "$BATCH_FILE" ]]; then
@@ -69,6 +86,33 @@ done
 
 if [[ "$healthy" == "false" ]]; then
   echo "WARNING: Container did not report healthy after $MAX_HEALTH_ATTEMPTS attempts. Proceeding anyway..." >&2
+fi
+
+# ── warm-up (opt-in) ─────────────────────────────────────────────────────────
+if [[ "$WARMUP" == "true" ]]; then
+  echo "Warm-up requested — pulling model..."
+  curl -s -X POST "$PULL_URL" -H "Content-Type: application/json" --max-time 30 >/dev/null || true
+
+  MAX_WARMUP_ATTEMPTS=60
+  WARMUP_SLEEP=15
+  warmed_up=false
+  for (( w=1; w<=MAX_WARMUP_ATTEMPTS; w++ )); do
+    state=$(curl -s --max-time 10 "$STATUS_URL" | jq -r '.state // "unknown"')
+    echo "  Model state: $state (attempt $w/$MAX_WARMUP_ATTEMPTS)"
+    if [[ "$state" == "ready" ]]; then
+      warmed_up=true
+      break
+    fi
+    if [[ "$state" == "error" ]]; then
+      err_detail=$(curl -s --max-time 10 "$STATUS_URL" | jq -r '.error // "unknown error"')
+      echo "ERROR: Model warm-up failed: $err_detail" >&2
+      exit 1
+    fi
+    sleep "$WARMUP_SLEEP"
+  done
+  if [[ "$warmed_up" == "false" ]]; then
+    echo "WARNING: Model did not reach 'ready' after $MAX_WARMUP_ATTEMPTS attempts. Proceeding anyway..." >&2
+  fi
 fi
 
 # ── POST to /generate ────────────────────────────────────────────────────────
