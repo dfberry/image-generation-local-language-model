@@ -724,6 +724,55 @@ The server accepts **two request shapes** — pick whichever is convenient:
 | `height` | Must be exactly 512, 768, or 1024 |
 | `prompts` | Must be present and non-empty |
 
+### Pre-warming the model (optional but recommended)
+
+Azure Container Apps scales to zero when idle. When the app wakes from zero, the very first `/generate` request must download the ~7 GB SDXL model into the Azure Files cache before work can begin — this adds roughly 6 minutes of latency inline to that first request. Pre-warming lets you trigger that download deliberately in the background, poll until it finishes, and then send your real batch to a warm cache. Pre-warming is optional: `/generate` still works without it and will absorb the cold-start download itself.
+
+**Step 1 — kick off the pull (returns 202 immediately):**
+
+bash / curl.exe:
+
+```bash
+FQDN="sdxl-generation-api.victoriousforest-12ab.eastus.azurecontainerapps.io"
+
+curl.exe -X POST "https://$FQDN/model/pull" \
+  -H "Content-Type: application/json"
+```
+
+PowerShell:
+
+```powershell
+$fqdn = "sdxl-generation-api.victoriousforest-12ab.eastus.azurecontainerapps.io"
+
+Invoke-RestMethod -Uri "https://$fqdn/model/pull" -Method Post
+```
+
+**Step 2 — poll `GET /model/status` until `state` is `ready` (or `error`):**
+
+bash (requires `jq`):
+
+```bash
+while true; do
+  state=$(curl -s "https://$FQDN/model/status" | jq -r '.state')
+  echo "Model state: $state"
+  [[ "$state" == "ready" || "$state" == "error" ]] && break
+  sleep 15
+done
+```
+
+PowerShell:
+
+```powershell
+do {
+  $status = Invoke-RestMethod -Uri "https://$fqdn/model/status"
+  Write-Host "Model state: $($status.state)"
+  if ($status.state -eq "ready" -or $status.state -eq "error") { break }
+  Start-Sleep -Seconds 15
+} while ($true)
+```
+
+`/model/status` always returns HTTP 200. Possible `state` values: `not_started`, `in_progress`, `ready`, `error`. Once `ready`, proceed to send your batch.
+
 ### Sending your batch.json to the cloud
 
 > **Can I send `batch.json` as-is?**
