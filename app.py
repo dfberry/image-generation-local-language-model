@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 """
 Flask wrapper for SDXL image generation.
-Exposes /generate POST endpoint accepting JSON batch configs.
+
+Endpoints:
+  GET  /             - API info
+  GET  /health       - Health check (no model load)
+  POST /generate     - Generate images from a batch config (loads model on first call)
+  POST /model/pull   - Kick off async model download/warm-up; returns 202 immediately
+  GET  /model/status - Poll warm-up state: not_started | in_progress | ready | error
 """
 
 import base64
+import gc
 import json
 import logging
 import os
+import threading
 from typing import Any, Optional
 
 import torch
 from flask import Flask, request, jsonify
 from datetime import datetime, timezone
 
-from src.image_generation.generate import run_batch, OOMError, get_device
+from src.image_generation.generate import run_batch, OOMError, get_device, load_base
 
 
 # Setup logging
@@ -25,6 +33,74 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# Model warm-up state
+# ---------------------------------------------------------------------------
+_model_state_lock = threading.Lock()
+_model_state: dict = {
+    "state": "not_started",   # not_started | in_progress | ready | error
+    "message": "Model has not been pulled yet.",
+    "started_at": None,
+    "finished_at": None,
+    "elapsed_seconds": None,
+    "error": None,
+}
+
+
+def _pull_worker() -> None:
+    """Background thread: loads the base model to warm the on-disk HF cache."""
+    device = get_device()
+    started = datetime.now(timezone.utc)
+
+    with _model_state_lock:
+        _model_state.update({
+            "state": "in_progress",
+            "message": f"Downloading/loading model on device '{device}'…",
+            "started_at": started.isoformat(),
+            "finished_at": None,
+            "elapsed_seconds": None,
+            "error": None,
+        })
+
+    logger.info("model/pull: starting load_base() to warm HF disk cache")
+
+    try:
+        pipe = load_base(device)
+
+        # Free the in-memory pipeline immediately — the durable win is the
+        # on-disk HF cache. run_batch() will reload from that warm cache when
+        # /generate is called, avoiding the expensive ~7 GB network download.
+        del pipe
+        gc.collect()
+
+        finished = datetime.now(timezone.utc)
+        elapsed = (finished - started).total_seconds()
+        logger.info(f"model/pull: done in {elapsed:.1f}s; in-memory pipeline released")
+
+        with _model_state_lock:
+            _model_state.update({
+                "state": "ready",
+                "message": "Model weights cached on disk. /generate will load from cache.",
+                "finished_at": finished.isoformat(),
+                "elapsed_seconds": elapsed,
+                "error": None,
+            })
+
+    except (OOMError, Exception) as exc:
+        finished = datetime.now(timezone.utc)
+        elapsed = (finished - started).total_seconds()
+        msg = str(exc)
+        logger.error(f"model/pull: failed after {elapsed:.1f}s — {msg}", exc_info=True)
+
+        with _model_state_lock:
+            _model_state.update({
+                "state": "error",
+                "message": "Model pull failed. See 'error' field.",
+                "finished_at": finished.isoformat(),
+                "elapsed_seconds": elapsed,
+                "error": msg,
+            })
 
 
 def validate_batch_config(config: dict) -> Optional[str]:
@@ -260,6 +336,92 @@ def generate_endpoint():
         }), 500
 
 
+@app.route("/model/pull", methods=["POST"])
+def model_pull():
+    """
+    POST /model/pull
+
+    Starts a one-time background download of the SDXL base model into the
+    HF disk cache. Returns 202 immediately; poll GET /model/status for progress.
+
+    Optional JSON body: {"force": true} — re-pull even if state is already "ready".
+
+    Response:
+        { "state": "in_progress"|"ready"|"error"|"not_started",
+          "message": "...", "timestamp": "..." }
+    """
+    body = request.get_json(silent=True) or {}
+    force = bool(body.get("force", False))
+
+    with _model_state_lock:
+        current_state = _model_state["state"]
+
+        if current_state == "in_progress":
+            return jsonify({
+                "state": "in_progress",
+                "message": "Pull already in progress.",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }), 202
+
+        if current_state == "ready" and not force:
+            return jsonify({
+                "state": "ready",
+                "message": "Model is already cached. Pass {\"force\": true} to re-pull.",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }), 200
+
+        # Transition to in_progress synchronously (inside the lock) so a
+        # concurrent caller sees the right state before the thread starts.
+        _model_state.update({
+            "state": "in_progress",
+            "message": "Pull started.",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "elapsed_seconds": None,
+            "error": None,
+        })
+
+    thread = threading.Thread(target=_pull_worker, daemon=True, name="model-pull")
+    thread.start()
+    logger.info("model/pull: background thread launched")
+
+    return jsonify({
+        "state": "in_progress",
+        "message": "Model pull started in background. Poll GET /model/status.",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }), 202
+
+
+@app.route("/model/status", methods=["GET"])
+def model_status():
+    """
+    GET /model/status
+
+    Returns the current model warm-up state.
+
+    Response (always HTTP 200):
+        { "state": "not_started"|"in_progress"|"ready"|"error",
+          "message": "...",
+          "started_at": "<ISO8601 or null>",
+          "finished_at": "<ISO8601 or null>",
+          "elapsed_seconds": <number or null>,
+          "error": "<string or null>",
+          "device": "cuda|mps|cpu",
+          "timestamp": "<ISO8601>" }
+    """
+    with _model_state_lock:
+        snapshot = dict(_model_state)
+
+    snapshot["device"] = get_device()
+    snapshot["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+    # Only include "error" key when state is error
+    if snapshot["state"] != "error":
+        snapshot.pop("error", None)
+
+    return jsonify(snapshot), 200
+
+
 @app.route("/", methods=["GET"])
 def root():
     """API root endpoint with basic info."""
@@ -269,7 +431,9 @@ def root():
         "endpoints": {
             "GET /": "This message",
             "GET /health": "Health check",
-            "POST /generate": "Generate images from batch config"
+            "POST /generate": "Generate images from batch config",
+            "POST /model/pull": "Start async model download/warm-up (returns 202)",
+            "GET /model/status": "Poll model warm-up state"
         },
         "documentation": "POST /generate with JSON batch config containing 'prompts' array"
     }), 200
