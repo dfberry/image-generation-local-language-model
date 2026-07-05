@@ -21,13 +21,6 @@ infra:
   parameters: infra/parameters.json
 
 hooks:
-  predeploy:
-    shell: sh
-    continueOnError: false
-    run: |
-      echo "Building Docker image (CPU)..."
-      docker build -f Dockerfile.cpu -t ${AZURE_CONTAINER_REGISTRY_ENDPOINT}/sdxl-api:latest .
-      echo "Docker image built successfully"
   postdeploy:
     shell: sh
     continueOnError: true

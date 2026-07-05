@@ -1,0 +1,25 @@
+{
+  "description": "This file configures a batch image-generation run using the object form of batch.json. The top-level 'description' field is metadata only — it is never read by the tool and has no effect on output. The 'settings' block sets global render parameters that apply to every prompt in the run: 'steps' controls the number of denoising iterations (higher = more detail and quality but slower; 40 is the recommended default); 'guidance' is the classifier-free guidance scale, also called CFG, which governs how strictly the model follows the prompt (7.5 is a balanced default; lower values give more creative freedom, higher values increase prompt adherence at the cost of diversity); 'width' and 'height' set the output image dimensions in pixels (SDXL is optimised for 1024x1024, which at 40 steps takes roughly 6 minutes per image on CPU — for a fast smoke test, drop to 768x768 at 20 steps for roughly 1-2 minutes per image); 'refine' enables the two-stage base+refiner pipeline for higher-quality output (requires the separate ~6 GB SDXL refiner model to be present in the HF cache); 'cpu' forces CPU inference regardless of whether a GPU is available (useful for CI or environments without CUDA/MPS). CLI flags always take precedence over these settings values, which in turn take precedence over the built-in defaults, so you can override any setting at the command line without editing this file. The 'prompts' array holds one object per image: 'prompt' (required) is the positive text description of what to generate; 'negative_prompt' (optional) lists concepts to suppress; 'seed' (optional) pins the random generator so the same seed plus the same settings always produces the same image, enabling reproducible results; 'output' (optional) sets the PNG save path — if omitted the tool auto-names the file with a timestamp under outputs/.",
+  "settings": {
+    "steps": 40,
+    "guidance": 7.5,
+    "width": 1024,
+    "height": 1024,
+    "refine": false,
+    "cpu": false
+  },
+  "prompts": [
+    {
+      "prompt": "a serene mountain lake at sunrise, golden light reflecting on calm water, photorealistic",
+      "negative_prompt": "blur, noise, oversaturated, cartoon, people, watermark, text",
+      "seed": 42,
+      "output": "outputs/mountain-lake.png"
+    },
+    {
+      "prompt": "a cozy coffee shop interior, warm lighting, books on shelves, empty chairs, soft morning light",
+      "negative_prompt": "people, crowded, dark, blurry, distorted",
+      "seed": 7,
+      "output": "outputs/coffee-shop.png"
+    }
+  ]
+}

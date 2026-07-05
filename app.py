@@ -4,6 +4,7 @@ Flask wrapper for SDXL image generation.
 Exposes /generate POST endpoint accepting JSON batch configs.
 """
 
+import base64
 import json
 import logging
 import os
@@ -96,9 +97,12 @@ def generate_endpoint():
         "results": [
             {
                 "prompt": "a tropical sunset",
-                "output": "/path/to/sunset.png",
+                "output": "/app/outputs/sunset.png",
                 "status": "ok",
-                "error": null
+                "error": null,
+                "filename": "sunset.png",
+                "content_type": "image/png",
+                "image_base64": "iVBORw0KGgo...=="
             }
         ],
         "timestamp": "2026-07-03T09:23:14Z"
@@ -188,6 +192,21 @@ def generate_endpoint():
                 logger.info(f"✅ Generated: {r['output']}")
             else:
                 logger.error(f"❌ {r['status']}: {r['error']}")
+
+        # Enrich ok results with base64 image bytes for ephemeral cloud filesystems
+        for r in results:
+            if r["status"] == "ok" and r.get("output") and os.path.isfile(r["output"]):
+                try:
+                    with open(r["output"], "rb") as f:
+                        r["image_base64"] = base64.b64encode(f.read()).decode("utf-8")
+                    r["filename"] = os.path.basename(r["output"])
+                    r["content_type"] = "image/png"
+                except Exception as read_err:
+                    r["image_base64"] = None
+                    existing_error = r.get("error") or ""
+                    r["error"] = f"{existing_error}; read error: {read_err}".lstrip("; ")
+            else:
+                r["image_base64"] = None
 
         return jsonify({
             "status": "success",

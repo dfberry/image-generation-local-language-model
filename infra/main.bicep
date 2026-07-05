@@ -2,12 +2,22 @@ param location string = resourceGroup().location
 param containerRegistryName string = 'sdxlregistry${uniqueString(resourceGroup().id)}'
 param containerAppName string = 'sdxl-generation-api'
 param environmentName string = 'sdxl-env'
-param imageName string = 'sdxl-api:latest'
+param imageName string = ''
 param containerRegistryUrl string = ''
 
-// Locals
+// Scaling overrides — can be set at deploy time via azd env set or --parameters.
+// minReplicas: 0 = scale-to-zero (cheapest, ~6-min cold start); 1 = always-warm (no cold start, higher cost).
+// maxReplicas: keep at 1 to cap cost; raise only if you need concurrent replicas (each adds a full D4 node).
+// Typed string (not int) so azd ${ENV_VAR} substitution in parameters.json round-trips cleanly through ARM;
+// aca.bicep converts to int with int() before use in the scale block.
+param minReplicas string = '0'
+param maxReplicas string = '1'
+
+// acrUrl is still used for the registry auth config in aca.bicep.
+// SERVICE_API_IMAGE_NAME (injected via parameters.json) is already the full registry/image:tag reference;
+// pass it through as-is. When empty (first provision), aca.bicep falls back to the placeholder image.
 var acrUrl = !empty(containerRegistryUrl) ? containerRegistryUrl : '${containerRegistryName}.azurecr.io'
-var fullImageName = '${acrUrl}/${imageName}'
+var fullImageName = imageName
 
 // Create Container Registry
 module acr 'resources/acr.bicep' = {
@@ -52,6 +62,8 @@ module containerApp 'resources/aca.bicep' = {
     storageAccountName: storage.outputs.storageAccountName
     storageAccountKey: storage.outputs.storageAccountKey
     workloadProfileName: caEnvironment.outputs.workloadProfileName
+    minReplicas: minReplicas
+    maxReplicas: maxReplicas
   }
 }
 
@@ -60,3 +72,4 @@ output containerAppUrl string = containerApp.outputs.fqdn
 output containerRegistryUrl string = acr.outputs.loginServer
 output containerAppName string = containerApp.outputs.containerAppName
 output environmentId string = caEnvironment.outputs.environmentId
+output AZURE_CONTAINER_REGISTRY_ENDPOINT string = acr.outputs.loginServer

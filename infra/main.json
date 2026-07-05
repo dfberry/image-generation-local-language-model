@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.42.1.51946",
-      "templateHash": "5496158293699294638"
+      "templateHash": "1164524017886273873"
     }
   },
   "parameters": {
@@ -27,16 +27,24 @@
     },
     "imageName": {
       "type": "string",
-      "defaultValue": "sdxl-api:latest"
+      "defaultValue": ""
     },
     "containerRegistryUrl": {
       "type": "string",
       "defaultValue": ""
+    },
+    "minReplicas": {
+      "type": "string",
+      "defaultValue": "0"
+    },
+    "maxReplicas": {
+      "type": "string",
+      "defaultValue": "1"
     }
   },
   "variables": {
     "acrUrl": "[if(not(empty(parameters('containerRegistryUrl'))), parameters('containerRegistryUrl'), format('{0}.azurecr.io', parameters('containerRegistryName')))]",
-    "fullImageName": "[format('{0}/{1}', variables('acrUrl'), parameters('imageName'))]"
+    "fullImageName": "[parameters('imageName')]"
   },
   "resources": [
     {
@@ -387,6 +395,12 @@
           },
           "workloadProfileName": {
             "value": "[reference(resourceId('Microsoft.Resources/deployments', 'aca-env-deployment'), '2025-04-01').outputs.workloadProfileName.value]"
+          },
+          "minReplicas": {
+            "value": "[parameters('minReplicas')]"
+          },
+          "maxReplicas": {
+            "value": "[parameters('maxReplicas')]"
           }
         },
         "template": {
@@ -396,7 +410,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.42.1.51946",
-              "templateHash": "1426463540839149306"
+              "templateHash": "8841905469686851562"
             }
           },
           "parameters": {
@@ -411,7 +425,8 @@
               "type": "string"
             },
             "imageName": {
-              "type": "string"
+              "type": "string",
+              "defaultValue": ""
             },
             "containerRegistryUrl": {
               "type": "string"
@@ -435,6 +450,14 @@
             "workloadProfileName": {
               "type": "string",
               "defaultValue": "sdxl-profile"
+            },
+            "minReplicas": {
+              "type": "string",
+              "defaultValue": "0"
+            },
+            "maxReplicas": {
+              "type": "string",
+              "defaultValue": "1"
             }
           },
           "resources": [
@@ -443,6 +466,9 @@
               "apiVersion": "2023-05-01",
               "name": "[parameters('containerAppName')]",
               "location": "[parameters('location')]",
+              "tags": {
+                "azd-service-name": "api"
+              },
               "properties": {
                 "workloadProfileName": "[parameters('workloadProfileName')]",
                 "environmentId": "[parameters('containerAppsEnvironmentId')]",
@@ -463,7 +489,7 @@
                   "containers": [
                     {
                       "name": "sdxl-api",
-                      "image": "[parameters('imageName')]",
+                      "image": "[if(not(empty(parameters('imageName'))), parameters('imageName'), 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest')]",
                       "resources": {
                         "cpu": "[json('4')]",
                         "memory": "16Gi"
@@ -499,8 +525,8 @@
                   ],
                   "volumes": "[if(not(empty(parameters('storageAccountName'))), createArray(createObject('name', 'models-cache', 'storageType', 'AzureFile', 'storageName', 'models-storage')), createArray())]",
                   "scale": {
-                    "minReplicas": 0,
-                    "maxReplicas": 1
+                    "minReplicas": "[int(parameters('minReplicas'))]",
+                    "maxReplicas": "[int(parameters('maxReplicas'))]"
                   }
                 }
               }
@@ -545,6 +571,10 @@
     "environmentId": {
       "type": "string",
       "value": "[reference(resourceId('Microsoft.Resources/deployments', 'aca-env-deployment'), '2025-04-01').outputs.environmentId.value]"
+    },
+    "AZURE_CONTAINER_REGISTRY_ENDPOINT": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'acr-deployment'), '2025-04-01').outputs.loginServer.value]"
     }
   }
 }

@@ -48,7 +48,20 @@ services:
       - ./outputs:/app/outputs
 
 volumes:
-  # Named volume for the Hugging Face model cache.
+  # Named volume for the Hugging Face model cache (~7 GB, downloaded on first run).
   # Lives at /root/.cache/huggingface (= HF_HOME) inside the container.
-  # Remove with: docker volume rm <project>_hf-cache   (forces fresh model download)
+  #
+  # external: true tells Compose "this volume was not created by this project; use it as-is."
+  # This suppresses the "not created by Docker Compose" warning on machines where the
+  # volume already exists (e.g. created by a previous run under a different Compose project).
+  #
+  # FRESH CLONE — one-time setup:
+  #   docker volume create public-dfberry-image-generation-local-language-model_hf-cache
+  #   (run this once before your first `docker compose run`; model then downloads into it)
+  #
+  # Remove/reset the cache:
+  #   docker volume rm public-dfberry-image-generation-local-language-model_hf-cache
+  #   docker volume create public-dfberry-image-generation-local-language-model_hf-cache
   hf-cache:
+    external: true
+    name: public-dfberry-image-generation-local-language-model_hf-cache

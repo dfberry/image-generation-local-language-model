@@ -1,13 +1,19 @@
 """
-Optional prewarm helper: pre-populate the HF model cache before the container
-starts so the first generation request doesn't have to wait for a ~7 GB download.
+Optional prewarm helper: pre-populate the HF model cache before a run so the
+first generation request doesn't have to wait for a ~7 GB download.
 
 This script is NOT required — the app downloads models on demand into the HF
-cache directory on first use.  Run it ahead of time (e.g., as a one-shot init
-container or a manual cache-warm step) if you want instant startup.
+cache directory on first use.  Run it ahead of time (e.g., locally before the
+first CLI run, or as a one-shot init container) if you want instant startup.
 
-The cache directory is controlled by $HF_HOME (default: /root/.cache/huggingface).
-Mount a persistent volume at that path so the download survives container restarts.
+Cache directory behaviour:
+  - When HF_HOME is set (e.g. in containers): downloads to $HF_HOME/hub — same
+    path the app reads, so the prewarm is used immediately.
+  - When HF_HOME is unset (local host): no cache_dir override is passed;
+    snapshot_download uses the huggingface_hub library default
+    (~/.cache/huggingface/hub), which is exactly where DiffusionPipeline reads.
+
+Mount a persistent volume at $HF_HOME so downloads survive container restarts.
 
 Environment variables:
   SDXL_BASE_MODEL     — HF repo id for the base model
@@ -31,10 +37,12 @@ MODEL_REVISION = os.environ.get("SDXL_MODEL_REVISION") or None
 HF_TOKEN = os.environ.get("HUGGING_FACE_TOKEN") or os.environ.get("HF_TOKEN") or None  # HF_TOKEN is the huggingface_hub standard auto-detected fallback
 BAKE_REFINER = os.environ.get("BAKE_REFINER", "false").lower() == "true"
 
-# Resolve cache dir the same way huggingface_hub does: $HF_HOME/hub.
-# When the BuildKit cache mount sets HF_HOME=/tmp/hf-cache, downloads go there;
-# the Dockerfile then copies that tree into the real image layer at the default path.
-CACHE_DIR = os.path.join(os.environ.get("HF_HOME", "/root/.cache/huggingface"), "hub")
+# When HF_HOME is set (containers), resolve $HF_HOME/hub so prewarm and app read
+# the same path.  When unset (local host), pass no cache_dir — snapshot_download
+# then uses the huggingface_hub library default (~/.cache/huggingface/hub), which
+# is exactly where DiffusionPipeline.from_pretrained reads on the same host.
+_hf_home = os.environ.get("HF_HOME")
+CACHE_DIR = os.path.join(_hf_home, "hub") if _hf_home else None
 
 kwargs = {}
 if MODEL_REVISION:
@@ -45,8 +53,12 @@ if HF_TOKEN:
 
 def download(repo_id: str) -> None:
     print(f"⬇️  Downloading {repo_id}" + (f" @ {MODEL_REVISION}" if MODEL_REVISION else "") + " …")
-    snapshot_download(repo_id=repo_id, cache_dir=CACHE_DIR, **kwargs)
-    print(f"✅  {repo_id} cached to {CACHE_DIR}")
+    kw = dict(kwargs)
+    if CACHE_DIR is not None:
+        kw["cache_dir"] = CACHE_DIR
+    snapshot_download(repo_id=repo_id, **kw)
+    cache_display = CACHE_DIR or "default HF cache (~/.cache/huggingface/hub)"
+    print(f"✅  {repo_id} cached to {cache_display}")
 
 
 download(BASE_MODEL)

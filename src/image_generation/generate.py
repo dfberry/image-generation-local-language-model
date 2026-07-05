@@ -38,6 +38,20 @@ from diffusers import DiffusionPipeline
 # may conflict with the 1024 px defaults and the 80/20 step-split; those
 # paths would need code changes before a cross-architecture swap is safe.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Built-in defaults for all six global render settings.
+# Used in parse_args() resolution AND as run_batch() kwarg defaults so there
+# is exactly one source of truth — no duplicated magic numbers.
+# ---------------------------------------------------------------------------
+DEFAULTS = {
+    "steps": 40,
+    "guidance": 7.5,
+    "width": 1024,
+    "height": 1024,
+    "refine": False,
+    "cpu": False,
+}
+
 BASE_MODEL_ID = os.environ.get(
     "SDXL_BASE_MODEL", "stabilityai/stable-diffusion-xl-base-1.0"
 )
@@ -63,15 +77,21 @@ def parse_args():
     group.add_argument("--batch-file", dest="batch_file", metavar="PATH",
                        help="JSON file with list of prompt dicts for batch generation")
     parser.add_argument("--output", default=None, help="Output file path")
-    parser.add_argument("--steps", type=int, default=40, help="Number of inference steps")
-    parser.add_argument("--guidance", type=float, default=7.5, help="Guidance scale (CFG)")
-    parser.add_argument("--width", type=int, default=1024, help="Image width in pixels")
-    parser.add_argument("--height", type=int, default=1024, help="Image height in pixels")
+    # Defaults are None so main() can detect whether the flag was explicitly passed.
+    # None is resolved to the built-in default (DEFAULTS dict) before use.
+    parser.add_argument("--steps", type=int, default=None, help="Number of inference steps")
+    parser.add_argument("--guidance", type=float, default=None, help="Guidance scale (CFG)")
+    parser.add_argument("--width", type=int, default=None, help="Image width in pixels")
+    parser.add_argument("--height", type=int, default=None, help="Image height in pixels")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--negative-prompt", dest="negative_prompt", default=None,
                         help="Negative prompt (things to avoid in the image)")
-    parser.add_argument("--refine", action="store_true", help="Use base + refiner pipeline (higher quality)")
-    parser.add_argument("--cpu", action="store_true", help="Force CPU mode (slow, no GPU required)")
+    # store_true with default=None: absent → None, present → True.
+    # None means "not explicitly passed"; used for CLI-vs-file precedence.
+    parser.add_argument("--refine", action="store_true", default=None,
+                        help="Use base + refiner pipeline (higher quality)")
+    parser.add_argument("--cpu", action="store_true", default=None,
+                        help="Force CPU mode (slow, no GPU required)")
     return parser.parse_args()
 
 
@@ -161,8 +181,14 @@ def load_refiner(text_encoder_2, vae, device: str) -> DiffusionPipeline:
     return refiner
 
 
-def generate(args) -> str:
-    """Run image generation and save to output path."""
+def generate(args, *, pipeline=None) -> str:
+    """Run image generation and save to output path.
+
+    pipeline: optional pre-loaded DiffusionPipeline (non-refine path only).
+      When supplied, it is reused as-is and NOT freed in finally — the caller
+      owns its lifecycle and is responsible for cleanup.  When None, the function
+      loads and frees its own pipeline (original standalone behaviour).
+    """
     device = get_device(args.cpu)
     negative_prompt = getattr(args, 'negative_prompt', None)
 
@@ -174,7 +200,9 @@ def generate(args) -> str:
     if torch.backends.mps.is_available():
         torch.mps.empty_cache()
 
-    # Set up generator for reproducible output
+    # Set up generator for reproducible output.
+    # Re-created every call so per-prompt seeds are always honoured, even when
+    # the pipeline is reused across prompts in a batch.
     generator = None
     if args.seed is not None:
         # Fix C: cpu_offload routes layers to CPU for "cpu"/"mps" devices,
@@ -193,9 +221,22 @@ def generate(args) -> str:
     # Base+refiner split: 80% of steps on base, 20% on refiner
     high_noise_frac = 0.8
 
+    # True when the caller supplied a pre-loaded pipeline for the non-refine path.
+    # In that case the finally block must NOT del it — the caller owns its lifecycle.
+    # The refine path always loads its own base (it must be freed before loading the
+    # refiner to avoid keeping both resident simultaneously), so caller_owns_pipeline
+    # is always False on the refine path regardless of the pipeline= argument.
+    caller_owns_pipeline = pipeline is not None and not args.refine
+
     base = refiner = latents = text_encoder_2 = vae = image = None
     try:
         if args.refine:
+            # Refine path: per-call base load/free is preserved intentionally.
+            # The refiner shares text_encoder_2 and vae with the base pipeline.
+            # The base must be freed before the refiner is loaded to avoid keeping
+            # both resident simultaneously — doing so risks OOM on low-VRAM GPUs.
+            # Making this path truly load-once would require holding both pipelines
+            # in VRAM at the same time, which is unsafe on constrained devices.
             print(f"🎨 Running base + refiner pipeline ({args.steps} steps total)...")
             base = load_base(device)
 
@@ -242,7 +283,8 @@ def generate(args) -> str:
             ).images[0]
         else:
             print(f"🎨 Running base model ({args.steps} steps)...")
-            base = load_base(device)
+            # Use the caller's pre-loaded pipeline if supplied; otherwise load one.
+            base = pipeline if caller_owns_pipeline else load_base(device)
             image = base(
                 prompt=args.prompt,
                 negative_prompt=negative_prompt,
@@ -269,6 +311,8 @@ def generate(args) -> str:
         raise
     finally:
         # Unconditional cleanup — runs on success, OOM, interrupt, or any exception.
+        # `del base` is always safe: when base holds the caller's pipeline, del only
+        # removes our local reference; the caller's own variable keeps the object alive.
         # base may already be None (freed mid-refine path) but del is safe on None.
         del base, refiner, latents, text_encoder_2, vae
         image = None
@@ -280,7 +324,9 @@ def generate(args) -> str:
         # dynamo cache that survives del base. Reset it to prevent accumulation across
         # repeated generate() calls. If torch.compile is added for other devices later,
         # broaden this guard accordingly.
-        if device == "cuda" and hasattr(torch, "_dynamo"):
+        # Skip reset when using a caller-supplied pipeline; run_batch performs a
+        # single reset in its own finally after the full batch completes.
+        if not caller_owns_pipeline and device == "cuda" and hasattr(torch, "_dynamo"):
             torch._dynamo.reset()
 
     return output_path
@@ -289,12 +335,12 @@ def generate(args) -> str:
 def run_batch(
     prompts: list[dict],
     *,
-    steps: int = 40,
-    guidance: float = 7.5,
-    width: int = 1024,
-    height: int = 1024,
-    refine: bool = False,
-    cpu: bool = False,
+    steps: int = DEFAULTS["steps"],
+    guidance: float = DEFAULTS["guidance"],
+    width: int = DEFAULTS["width"],
+    height: int = DEFAULTS["height"],
+    refine: bool = DEFAULTS["refine"],
+    cpu: bool = DEFAULTS["cpu"],
 ) -> list[dict]:
     """
     Canonical batch engine — used by both the CLI and the Flask server.
@@ -309,63 +355,80 @@ def run_batch(
         {"prompt": str, "output": str|None, "status": "ok"|"oom_error"|"error", "error": str|None}
     """
     results = []
-    for i, item in enumerate(prompts):
-        args = SimpleNamespace(
-            prompt=item["prompt"],
-            negative_prompt=item.get("negative_prompt"),
-            output=item.get("output"),
-            seed=item.get("seed"),
-            steps=steps,
-            guidance=guidance,
-            width=width,
-            height=height,
-            refine=refine,
-            cpu=cpu,
-        )
-        try:
-            output_path = generate_with_retry(args)
-            results.append({
-                "prompt": item["prompt"],
-                "output": output_path,
-                "status": "ok",
-                "error": None,
-            })
-        except OOMError as exc:
-            results.append({
-                "prompt": item["prompt"],
-                "output": item.get("output"),
-                "status": "oom_error",
-                "error": str(exc),
-            })
-        except Exception as exc:
-            results.append({
-                "prompt": item["prompt"],
-                "output": item.get("output"),
-                "status": "error",
-                "error": str(exc),
-            })
+    device = get_device(cpu)
 
-        # Flush GPU memory between items (skip after the last item)
-        if i < len(prompts) - 1:
-            gc.collect()
-            torch.cuda.empty_cache()
-            if torch.backends.mps.is_available():
-                torch.mps.empty_cache()
+    # Load the base pipeline once for the entire batch (non-refine path).
+    # CPU memory optimisations (attention_slicing, vae_slicing, vae_tiling) are
+    # applied inside load_base and therefore happen exactly once here.
+    # The refine path keeps per-item loading: the base must be freed before the
+    # refiner is loaded to avoid keeping both resident simultaneously (OOM risk on
+    # low-VRAM GPUs).  See the comment inside generate() for full rationale.
+    resident_pipeline = load_base(device) if not refine else None
+
+    try:
+        for item in prompts:
+            args = SimpleNamespace(
+                prompt=item["prompt"],
+                negative_prompt=item.get("negative_prompt"),
+                output=item.get("output"),
+                seed=item.get("seed"),
+                steps=steps,
+                guidance=guidance,
+                width=width,
+                height=height,
+                refine=refine,
+                cpu=cpu,
+            )
+            try:
+                output_path = generate_with_retry(args, pipeline=resident_pipeline)
+                results.append({
+                    "prompt": item["prompt"],
+                    "output": output_path,
+                    "status": "ok",
+                    "error": None,
+                })
+            except OOMError as exc:
+                results.append({
+                    "prompt": item["prompt"],
+                    "output": item.get("output"),
+                    "status": "oom_error",
+                    "error": str(exc),
+                })
+            except Exception as exc:
+                results.append({
+                    "prompt": item["prompt"],
+                    "output": item.get("output"),
+                    "status": "error",
+                    "error": str(exc),
+                })
+    finally:
+        # Free the resident pipeline after all prompts complete (or on failure
+        # mid-batch).  When refine=True, resident_pipeline is None; del None is safe.
+        del resident_pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        # Fix 2: Reset torch.compile's dynamo cache once for the full batch.
+        if device == "cuda" and hasattr(torch, "_dynamo"):
+            torch._dynamo.reset()
 
     return results
 
 
-def generate_with_retry(args, max_retries: int = 2) -> str:
+def generate_with_retry(args, max_retries: int = 2, *, pipeline=None) -> str:
     """
     Wraps generate(args) with OOM retry logic.
     - On OOMError: halves args.steps (floor at 1), prints warning, retries
     - Retries up to max_retries times (so up to max_retries+1 total calls)
     - If all retries exhausted: raises OOMError with message mentioning final steps count
     - Non-OOM exceptions: re-raised immediately, no retry
+    - pipeline: forwarded to generate(); when supplied, retries reuse the same
+      loaded pipeline without reloading (caller owns lifecycle).
     """
     for attempt in range(max_retries + 1):
         try:
-            return generate(args)
+            return generate(args, pipeline=pipeline)
         except OOMError:
             if attempt == max_retries:
                 raise OOMError(
@@ -380,26 +443,69 @@ def main():
     if hasattr(args, 'batch_file') and args.batch_file:
         try:
             with open(args.batch_file, encoding="utf-8") as f:
-                prompts = json.load(f)
+                data = json.load(f)
         except FileNotFoundError:
             print(f"Error: batch file not found: {args.batch_file}", file=sys.stderr)
             sys.exit(1)
         except json.JSONDecodeError as e:
             print(f"Error: invalid JSON in batch file: {e}", file=sys.stderr)
             sys.exit(1)
+
+        if isinstance(data, list):
+            # Legacy array form — globals come only from CLI/defaults.
+            prompts = data
+            file_settings = {}
+        elif isinstance(data, dict):
+            # New object form — may contain "settings" and must contain "prompts".
+            file_settings = data.get("settings") or {}
+            prompts = data.get("prompts")
+            if not isinstance(prompts, list) or len(prompts) == 0:
+                print(
+                    "Error: batch file object form requires a non-empty 'prompts' list.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        else:
+            print(
+                "Error: batch file must be a JSON array (legacy) or a JSON object with a 'prompts' key.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        def _resolve(cli_val, file_val, default):
+            """Return first non-None value: CLI flag > file setting > built-in default."""
+            if cli_val is not None:
+                return cli_val
+            if file_val is not None:
+                return file_val
+            return default
+
         results = run_batch(
             prompts,
-            steps=args.steps,
-            guidance=args.guidance,
-            width=args.width,
-            height=args.height,
-            refine=args.refine,
-            cpu=args.cpu,
+            steps=_resolve(args.steps, file_settings.get("steps"), DEFAULTS["steps"]),
+            guidance=_resolve(args.guidance, file_settings.get("guidance"), DEFAULTS["guidance"]),
+            width=_resolve(args.width, file_settings.get("width"), DEFAULTS["width"]),
+            height=_resolve(args.height, file_settings.get("height"), DEFAULTS["height"]),
+            refine=_resolve(args.refine, file_settings.get("refine"), DEFAULTS["refine"]),
+            cpu=_resolve(args.cpu, file_settings.get("cpu"), DEFAULTS["cpu"]),
         )
         for r in results:
             status = r['status']
             print(f"[{status}] {r['prompt'][:50]} → {r.get('output') or r.get('error', '')}")
     else:
+        # Single-prompt path: resolve any None CLI flags to built-in defaults.
+        if args.steps is None:
+            args.steps = DEFAULTS["steps"]
+        if args.guidance is None:
+            args.guidance = DEFAULTS["guidance"]
+        if args.width is None:
+            args.width = DEFAULTS["width"]
+        if args.height is None:
+            args.height = DEFAULTS["height"]
+        if args.refine is None:
+            args.refine = DEFAULTS["refine"]
+        if args.cpu is None:
+            args.cpu = DEFAULTS["cpu"]
         generate_with_retry(args)
 
 

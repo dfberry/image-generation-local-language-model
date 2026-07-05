@@ -97,7 +97,7 @@ Or by name: `docker volume ls` then `docker volume rm <project>_hf-cache`.
 
 ### Layer 3 — Cloud (Azure Container Apps)
 
-`azd up` builds the Docker image, pushes it to Azure Container Registry, and deploys a Container App in the configured region (default: `eastus`).
+`azd up` provisions Azure infrastructure (ACR, Storage, ACA Environment, Container App), then builds the Docker image using `Dockerfile.cpu`, pushes it to Azure Container Registry, and updates the Container App to the real image — all in one command. On the very first deploy, the Container App provisions with a harmless placeholder image so ARM succeeds before the ACR is populated; azd then swaps in the real image during the deploy phase.
 
 **Persistent model storage via Azure Files:**
 
@@ -109,7 +109,7 @@ The same pattern that works locally with a named volume works on ACA with an Azu
 
 2. **Optional: init container** to pre-warm the share before the main container starts. Run `scripts/download_model.py` as an init container — on the very first deploy it downloads ~7 GB; on all subsequent starts it detects weights already present and exits immediately. See `/azure/container-apps/init-containers`.
 
-3. **Set `minReplicas: 1`** to keep one warm replica loaded and avoid cold-start load time.
+3. **Set `minReplicas: 0`** (default) to reduce cost — the container stops when idle. First request after idle triggers a cold start: the model must reload from the Azure Files share into memory (~6 min typical on CPU). Set `minReplicas: 1` to keep one warm replica loaded and avoid cold-start delay, at the cost of running the D4 node 24/7.
 
 4. **Add a readiness probe** on `/health` so ACA only routes traffic once the model is in memory:
 
@@ -177,7 +177,30 @@ pip install -r requirements.txt
 
 **Note:** Sets up local Python dependencies for running the CLI or server directly on the host, outside Docker. The model downloads on demand the first time you run the CLI — not during `pip install`.
 
-### 2. Run CLI batch locally
+### 2. Download the model (optional pre-fetch)
+
+Pre-download the ~7 GB base model into the HF cache so the first generation run is instant.  
+This step is **optional** — if you skip it, step 3 downloads the model automatically on first run (you'll just wait during that run).
+
+```bash
+python scripts/download_model.py
+```
+
+```powershell
+python scripts/download_model.py
+```
+
+To also pre-fetch the ~6 GB refiner model, set `BAKE_REFINER=true`:
+
+```bash
+BAKE_REFINER=true python scripts/download_model.py
+```
+
+```powershell
+$env:BAKE_REFINER = "true"; python scripts/download_model.py
+```
+
+### 3. Run CLI batch locally
 
 ```bash
 PYTHONPATH=src python -m image_generation.generate --batch-file batch.json
@@ -188,9 +211,88 @@ $env:PYTHONPATH = "src"
 python -m image_generation.generate --batch-file batch.json
 ```
 
-First run downloads ~7 GB from Hugging Face into the default HF cache (`~/.cache/huggingface`). Subsequent runs load from cache. Output PNGs land in the paths specified in `batch.json`.
+If you skipped step 2, the first run downloads ~7 GB from Hugging Face into the default HF cache (`~/.cache/huggingface`) on demand. If you completed step 2, the model loads from cache immediately. Output PNGs land in the paths specified in `batch.json`.
 
-### 3. Optional: Run Flask Server Locally
+#### Settings
+
+There are two tiers of settings. **Per-item** settings live inside `batch.json`; **global** settings can live in a `settings` block in `batch.json` or be passed as CLI flags.
+
+**Per-item settings** — keys in each prompt object:
+
+| Key | Meaning | Required | Default |
+|---|---|---|---|
+| `prompt` | What to generate | ✅ yes | — |
+| `negative_prompt` | What to avoid | optional | none |
+| `seed` | Fixed seed for reproducibility (same seed + settings → same image) | optional | random |
+| `output` | Output PNG path | optional | auto-named |
+
+**Global render settings** — can live in the `settings` block of the object-form `batch.json`, or be overridden at the command line. **Precedence: CLI flag > file `settings` value > built-in default.**
+
+| Setting / Flag | Default | Meaning |
+|---|---|---|
+| `steps` / `--steps` | 40 | Denoising steps — higher = more detail, slower. 1024×1024 @ 40 steps ≈ 6 min/image on CPU; 768×768 @ 20 steps is a fast smoke test |
+| `guidance` / `--guidance` | 7.5 | Classifier-free guidance (CFG) — how strictly the model follows the prompt |
+| `width` / `--width` | 1024 | Image width in pixels |
+| `height` / `--height` | 1024 | Image height in pixels |
+| `refine` / `--refine` | false | Run the SDXL refiner pass (needs the ~6 GB refiner model) |
+| `cpu` / `--cpu` | false | Force CPU inference (otherwise auto-detects CUDA/MPS) |
+
+**Batch file formats** — two shapes are supported:
+
+*Object form* (recommended — self-documenting, settings live in the file):
+
+```json
+{
+  "description": "optional free-text — ignored by the tool",
+  "settings": {
+    "steps": 40,
+    "guidance": 7.5,
+    "width": 1024,
+    "height": 1024,
+    "refine": false,
+    "cpu": false
+  },
+  "prompts": [
+    {
+      "prompt": "a serene mountain lake at sunrise, photorealistic",
+      "negative_prompt": "blur, noise, cartoon",
+      "seed": 42,
+      "output": "outputs/mountain-lake.png"
+    }
+  ]
+}
+```
+
+*Array form* (legacy — still fully supported; globals come from CLI flags or defaults):
+
+```json
+[
+  {
+    "prompt": "a serene mountain lake at sunrise, photorealistic",
+    "negative_prompt": "blur, noise, cartoon",
+    "seed": 42,
+    "output": "outputs/mountain-lake.png"
+  }
+]
+```
+
+CLI flags always win. For example, `--steps 20` overrides `"steps": 40` in the file.
+
+Example with every global setting made explicit via CLI:
+
+```bash
+PYTHONPATH=src python -m image_generation.generate --batch-file batch.json \
+  --steps 40 --guidance 7.5 --width 1024 --height 1024
+```
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m image_generation.generate --batch-file batch.json --steps 40 --guidance 7.5 --width 1024 --height 1024
+```
+
+> ⚠️ The defaults (1024×1024, 40 steps) are heavy on CPU (~6 min/image). For a fast local smoke test, drop to `--width 768 --height 768 --steps 20` or set those values in the `settings` block.
+
+### 4. Optional: Run Flask Server Locally
 
 ```console
 python app.py
@@ -202,7 +304,7 @@ WARNING in flask.app: This is a development server. Do not use it in production.
  * Running on http://0.0.0.0:8000
 ```
 
-### 4. Test the API
+### 5. Test the API
 
 **Health check:**
 ```bash
@@ -362,9 +464,69 @@ Everything runs via Docker Compose — no Python environment needed on the host.
 
 ### Which image?
 
-> **Windows devbox / WSL2 (no NVIDIA GPU passthrough):** use `Dockerfile.cpu` (the default in `docker-compose.yml`) — do NOT use `--gpus all`. Most Windows developer machines fall into this category. If you see `nvidia-container-cli: initialization error: WSL environment detected but no adapters were found`, you need the CPU image.
->
-> **GPU image** (`Dockerfile` + `--gpus all`) requires a real NVIDIA GPU **and** the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) for WSL2. Verify with `nvidia-smi` first.
+| Platform | Dockerfile | Works? |
+|---|---|---|
+| Windows (any — no NVIDIA GPU) | `Dockerfile.cpu` | ✅ Default — use this |
+| macOS (Intel or Apple Silicon) | `Dockerfile.cpu` | ✅ Default — use this |
+| Linux (no NVIDIA GPU) | `Dockerfile.cpu` | ✅ Default — use this |
+| Cloud / Azure Container Apps | `Dockerfile.cpu` | ✅ Used by `azure.yaml` |
+| Linux + NVIDIA GPU (native, NVIDIA Container Toolkit installed) | `Dockerfile` | ✅ Faster local generation |
+| Windows + NVIDIA GPU via WSL2 GPU passthrough (NVIDIA Container Toolkit inside WSL2) | `Dockerfile` | ✅ Verify with `nvidia-smi` first |
+| macOS (any) | `Dockerfile` | ❌ No NVIDIA GPU on Mac; Docker Desktop cannot pass through any GPU |
+
+**CPU image (`Dockerfile.cpu`)** is the default for everyone. It is used by `docker-compose.yml`, `azure.yaml`, and the infra deploy. No GPU, no NVIDIA toolkit — it just works.
+
+**GPU image (`Dockerfile`)** is optional and only useful on machines with a real NVIDIA GPU. It is **not** wired into `docker-compose.yml` or `azure.yaml` (a `docker-compose.gpu.yml` does not exist in this repo). The working path for GPU users is direct Docker commands:
+
+```console
+docker build -t sdxl-cli:gpu .
+docker run --gpus all --rm -v ${PWD}:/data -v hf-cache:/root/.cache/huggingface sdxl-cli:gpu --batch-file /data/batch.json
+```
+
+> **Tip:** Run `nvidia-smi` first to confirm your GPU is visible to Docker. If you see `nvidia-container-cli: initialization error: WSL environment detected but no adapters were found`, GPU passthrough is not configured — use `Dockerfile.cpu` instead.
+
+### How docker-compose.yml works
+
+`docker-compose.yml` defines **two services**, both building from `Dockerfile.cpu`:
+
+- **`img-gen`** — the default CLI batch runner. Used with `docker compose run --rm img-gen ...`.
+- **`img-gen-server`** — optional HTTP server (`app.py`), gated behind the `server` Compose profile so it never starts accidentally. Activate with `docker compose --profile server up`.
+
+**Key mounts:**
+
+- **`./:/data:rw`** (bind-mount on `img-gen`) — the repo root is visible inside the container as `/data`. Your `batch.json` and `outputs/` are accessible with no copy step; generated images appear on your host the moment they are written.
+- **`hf-cache:/root/.cache/huggingface`** (both services) — a named volume at `HF_HOME`. The ~7 GB model downloads here once and is reused on every run.
+
+**Entrypoint** (from `Dockerfile.cpu`):
+
+```text
+ENTRYPOINT ["python", "-m", "image_generation.generate"]
+CMD ["--help"]
+```
+
+Args you pass to `docker compose run --rm img-gen` flow straight to the generator — e.g. `--batch-file /data/batch.json`.
+
+The volume is declared `external: true` with a pinned `name:` so Compose never silently recreates it and discards your cached weights — see **Step 0** below for the one-time creation command.
+
+### 0. Create the model-cache volume (one-time, fresh clone only)
+
+The `hf-cache` volume is declared `external` in `docker-compose.yml` so Compose never
+silently recreates it and loses your cached model weights. You must create it once before
+your first `docker compose run`:
+
+```console
+docker volume create public-dfberry-image-generation-local-language-model_hf-cache
+```
+
+After that, Compose reuses it automatically on every subsequent run. If you already ran a
+previous version of this project and the volume exists, skip this step — it is already there.
+
+**To wipe the cache and force a fresh model download:**
+
+```console
+docker volume rm public-dfberry-image-generation-local-language-model_hf-cache
+docker volume create public-dfberry-image-generation-local-language-model_hf-cache
+```
 
 ### 1. Build
 
@@ -452,6 +614,264 @@ Stop the server:
 docker compose --profile server down
 ```
 
+> The same `POST /generate` endpoint works against the deployed ACA service — no batch files needed. See [Generating images in the cloud (ACA)](#generating-images-in-the-cloud-aca) below.
+
+## Generating images in the cloud (ACA)
+
+The ACA deployment runs the same Flask HTTP server (`app.py`) you can start locally in [§ 5 above](#5-optional-http-server). The critical difference from local CLI usage: **there are no batch files in the cloud**. You send your prompts and settings as a JSON body in a `POST /generate` call — the server does not read files from disk.
+
+### Endpoints
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `GET /` | GET | API info / version |
+| `GET /health` | GET | Health check — returns `status` + `device`; does not load the model |
+| `POST /generate` | POST | Generate images from a JSON prompt list |
+
+### Get your deployed URL
+
+After `azd up` completes, retrieve the FQDN:
+
+```bash
+azd env get-values | grep CONTAINER_APP_FQDN
+```
+
+```powershell
+azd env get-values | Select-String CONTAINER_APP_FQDN
+```
+
+Or query it directly:
+
+```bash
+az containerapp show -n sdxl-generation-api -g rg-diberry-image \
+  --query properties.configuration.ingress.fqdn -o tsv
+```
+
+```powershell
+az containerapp show -n sdxl-generation-api -g rg-diberry-image `
+  --query properties.configuration.ingress.fqdn -o tsv
+```
+
+Your generate endpoint is then `https://<fqdn>/generate`.
+
+### ⚠️ Cold start — set a long client timeout
+
+With `minReplicas=0` (the default), the container stops when idle. The first request after an idle period triggers a cold start: container boot + loading the ~7 GB model from the Azure Files share ≈ **~6 minutes**. Your HTTP client must tolerate this latency.
+
+**Recommended workflow — poll `/health` before sending prompts:**
+
+```bash
+FQDN="<your-fqdn>"
+until curl -sf "https://$FQDN/health" | grep -q '"status":"healthy"'; do
+  echo "waiting for warm container..."; sleep 30
+done
+curl -X POST "https://$FQDN/generate" \
+  -H "Content-Type: application/json" \
+  --data-binary "@cloud-request.json"
+```
+
+```powershell
+$fqdn = "<your-fqdn>"
+do {
+  Start-Sleep 30
+  $h = try { Invoke-RestMethod "https://$fqdn/health" } catch { $null }
+} until ($h.status -eq "healthy")
+Invoke-RestMethod -Uri "https://$fqdn/generate" -Method Post -ContentType "application/json" -InFile "cloud-request.json"
+```
+
+To eliminate cold starts at the cost of 24/7 D4 compute, set `minReplicas=1` — see [Scaling parameters](#scaling-parameters).
+
+### Request body format
+
+The server reads a **flat JSON object** — settings live at the **top level**. There is no nested `settings` block and no `description` field (both belong to the CLI batch file format only):
+
+```json
+{
+  "prompts": [
+    {
+      "prompt": "a tropical sunset with palm trees, magical realism",
+      "seed": 42,
+      "output": "sunset.png",
+      "negative_prompt": "blur, noise"
+    }
+  ],
+  "steps": 40,
+  "guidance": 7.5,
+  "width": 1024,
+  "height": 1024,
+  "refine": false
+}
+```
+
+**Required:** `prompts` — a non-empty array; each item must contain a `"prompt"` string.  
+**Optional per prompt:** `seed`, `output`, `negative_prompt`.  
+**Top-level defaults if omitted:** `steps=40`, `guidance=7.5`, `width=1024`, `height=1024`, `refine=false`, `cpu=false`.
+
+**Server-enforced validation (returns HTTP 400 on failure):**
+
+| Field | Constraint |
+|---|---|
+| `steps` | 1 – 150 |
+| `guidance` | 0 – 50 |
+| `width` | Must be exactly 512, 768, or 1024 |
+| `height` | Must be exactly 512, 768, or 1024 |
+| `prompts` | Must be present and non-empty |
+
+### Converting a local batch.json to a cloud request
+
+The CLI **object-form** `batch.json` uses a nested `settings` block and an optional `description` key — neither is read by the server. To reuse your batch file against the cloud API, **flatten** it:
+
+**Before — CLI batch.json (object form with nested `settings`):**
+
+```json
+{
+  "description": "my batch",
+  "settings": {
+    "steps": 40,
+    "guidance": 7.5,
+    "width": 1024,
+    "height": 1024,
+    "refine": false
+  },
+  "prompts": [
+    { "prompt": "a serene mountain lake at sunrise", "seed": 42, "output": "mountain.png" }
+  ]
+}
+```
+
+**After — cloud-request.json (flat, server-ready):**
+
+```json
+{
+  "prompts": [
+    { "prompt": "a serene mountain lake at sunrise", "seed": 42, "output": "mountain.png" }
+  ],
+  "steps": 40,
+  "guidance": 7.5,
+  "width": 1024,
+  "height": 1024,
+  "refine": false
+}
+```
+
+Move the keys out of `settings` up to the top level; drop `description`; remove the now-empty `settings` key.
+
+### Send the request
+
+> ⚠️ **PowerShell users:** In PowerShell, `curl` is an alias for `Invoke-WebRequest` and does **not** accept `-H` or `-d`. Passing those flags fails with `"The term '-H' is not recognized"`. Use `Invoke-RestMethod` or call `curl.exe` explicitly (the real curl binary).
+
+**bash / curl.exe:**
+
+```bash
+FQDN="sdxl-generation-api.victoriousforest-12ab.eastus.azurecontainerapps.io"
+
+# Inline JSON
+curl.exe -X POST "https://$FQDN/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompts": [{"prompt": "a serene mountain lake at sunrise", "seed": 42}],
+    "steps": 40, "guidance": 7.5, "width": 1024, "height": 1024
+  }'
+
+# Or send from file
+curl.exe -X POST "https://$FQDN/generate" \
+  -H "Content-Type: application/json" \
+  --data-binary "@cloud-request.json"
+```
+
+**PowerShell (Invoke-RestMethod):**
+
+```powershell
+$fqdn = "sdxl-generation-api.victoriousforest-12ab.eastus.azurecontainerapps.io"
+
+# Option A — build body as a hashtable and serialize
+$body = @{
+  prompts  = @(@{ prompt = "a serene mountain lake at sunrise"; seed = 42 })
+  steps    = 40
+  guidance = 7.5
+  width    = 1024
+  height   = 1024
+  refine   = $false
+} | ConvertTo-Json -Depth 5
+Invoke-RestMethod -Uri "https://$fqdn/generate" -Method Post -ContentType "application/json" -Body $body
+
+# Option B — send from a saved JSON file
+Invoke-RestMethod -Uri "https://$fqdn/generate" -Method Post -ContentType "application/json" -InFile "cloud-request.json"
+```
+
+### Response body
+
+Each `ok` result now includes the image bytes base64-encoded in `image_base64`. Use `filename` (the basename) to name the file locally. `output` is the full path on the server's ephemeral disk — clients should ignore it and save using `filename` instead.
+
+```json
+{
+  "status": "success",
+  "device": "cpu",
+  "results": [
+    {
+      "prompt": "a serene mountain lake at sunrise",
+      "output": "/app/outputs/mountain.png",
+      "status": "ok",
+      "error": null,
+      "filename": "mountain.png",
+      "content_type": "image/png",
+      "image_base64": "iVBORw0KGgo...=="
+    }
+  ],
+  "timestamp": "2026-07-05T20:51:00.000000+00:00"
+}
+```
+
+Non-`ok` results have `image_base64: null` and no `filename` or `content_type`.
+
+### Retrieving generated images
+
+`/generate` returns each PNG **inline as base64** in the result's `image_base64` field. The server reads the file bytes and encodes them in the same request before responding, so images are available to callers even though `/app/outputs` is on the container's ephemeral filesystem and is not mounted to Azure Files.
+
+To save the image, decode `image_base64` and write it to a local file. Use the `filename` field for the local filename.
+
+**bash / jq:**
+
+```bash
+FQDN="sdxl-generation-api.victoriousforest-12ab.eastus.azurecontainerapps.io"
+
+curl -s -X POST "https://$FQDN/generate" \
+  -H "Content-Type: application/json" \
+  -d @request.json \
+  | jq -r '.results[0].image_base64' | base64 -d > sunset.png
+```
+
+To save each result by its `filename`:
+
+```bash
+response=$(curl -s -X POST "https://$FQDN/generate" \
+  -H "Content-Type: application/json" \
+  -d @request.json)
+
+echo "$response" | jq -c '.results[] | select(.status=="ok")' | while read -r item; do
+  fname=$(echo "$item" | jq -r '.filename')
+  echo "$item" | jq -r '.image_base64' | base64 -d > "$fname"
+  echo "Saved $fname"
+done
+```
+
+**PowerShell:**
+
+```powershell
+$fqdn = "sdxl-generation-api.victoriousforest-12ab.eastus.azurecontainerapps.io"
+
+$resp = Invoke-RestMethod -Uri "https://$fqdn/generate" -Method Post `
+  -ContentType "application/json" -InFile "request.json"
+
+foreach ($result in $resp.results) {
+  if ($result.status -eq "ok") {
+    $bytes = [Convert]::FromBase64String($result.image_base64)
+    [IO.File]::WriteAllBytes("$PWD\$($result.filename)", $bytes)
+    Write-Host "Saved $($result.filename)"
+  }
+}
+```
+
 ### 6. Cloud: ACA + Azure Files
 
 The same pattern that works locally with the `hf-cache` named volume maps directly to Azure Container Apps with an Azure Files share. Mount the share at `/root/.cache/huggingface` — model downloads once into the share, persists across scale-to-zero, shared across all replicas.
@@ -467,6 +887,60 @@ The same pattern that works locally with the `hf-cache` named volume maps direct
 | Model download | First `docker compose run` | First ACA start (init container or lazy) |
 | Survives restart | ✅ | ✅ (scale-to-zero safe) |
 | Shared across replicas | N/A | ✅ |
+
+## Azure cost & scaling choices
+
+SDXL CPU inference needs 4 vCPU and at least 12 GB RAM. That determines every cost choice below.
+
+### Why not the Consumption profile?
+
+ACA's **Consumption** profile is the cheapest option (pay-per-use, no management fee) but it caps at **4 vCPU / 8 GiB RAM**. SDXL base weights are ~7 GB (fp16) plus text encoders, VAE, and activations — CPU inference realistically needs **12 GB+ RAM** even with attention/VAE slicing and tiling. At 8 GiB the container will very likely OOM. Consumption is not a reliable choice for SDXL.
+
+### Dedicated D4 — smallest SKU that fits SDXL
+
+ACA Dedicated workload profiles start at **D4 (4 vCPU / 16 GiB)**. There is no smaller dedicated D-series option. D4 is the minimum reliable SKU for SDXL; the Bicep is already set to D4.
+
+A dedicated profile environment carries an **environment management fee** (~$70/month, approximate, region-dependent) that applies whenever a dedicated workload profile exists in the environment — even when all replicas are at zero. Verify the current figure in the [Azure Pricing Calculator](https://azure.microsoft.com/pricing/calculator/).
+
+### Scaling parameters
+
+`minReplicas` and `maxReplicas` are set via `azd` environment variables — the Bicep reads them through `infra/parameters.json` (`AZURE_MIN_REPLICAS`, default `0`; `AZURE_MAX_REPLICAS`, default `1`). Note: `azd up` does **not** accept a `--parameters` flag. Set the values, then deploy:
+
+```console
+azd env set AZURE_MIN_REPLICAS 1
+azd env set AZURE_MAX_REPLICAS 1   # default is 1
+azd up
+```
+
+> `azd env set` alone does not redeploy — you must follow with `azd up` for the change to take effect.
+
+### Cost choices at a glance
+
+| Choice | Effect | Cost direction |
+|---|---|---|
+| `minReplicas=0` (default) | Scale-to-zero: ~$0 idle compute; ~6-min cold start on first request after idle | ↓ cheapest |
+| `minReplicas=1` | Always-warm: no cold start; model stays in memory; D4 node runs 24/7 | ↑ highest compute cost |
+| `maxReplicas=1` (default) | Caps fan-out; never pay for more than one D4 node at a time | ↓ recommended |
+| `maxReplicas > 1` | Each additional replica spins up a full D4 node | ↑ multiplies node cost |
+| Dedicated D4 profile | 4 vCPU / 16 GiB — reliable for SDXL; carries environment management fee (~$70/mo approx) | ↑ fixed overhead |
+| Consumption profile | 4 vCPU / 8 GiB — cheaper but very likely OOM for SDXL | ↓ cheaper but unreliable |
+
+> All dollar figures are approximate and region-dependent. Verify current pricing in the [Azure Pricing Calculator](https://azure.microsoft.com/pricing/calculator/).
+
+### Recommended: cheapest-that-works
+
+**Dedicated D4, `minReplicas=0`, `maxReplicas=1`** — these are already the defaults.
+
+- You pay the ~$70/mo environment management fee regardless of activity.
+- Compute cost accrues only while a replica is running (active generation).
+- Cold start after idle: container starts, model loads from Azure Files share into memory (~6 min typical).
+- No surprise fan-out: `maxReplicas=1` means at most one D4 node is ever running.
+
+### Always-warm alternative
+
+Set `minReplicas=1`. The D4 node runs 24/7 — no cold start, model stays in memory. The additional cost is one D4 node running continuously. Use this if cold-start latency is unacceptable.
+
+> **The readiness probe on `/health` does NOT keep the app warm.** It tells ACA when the model has finished loading after a cold start, so traffic is only routed to a ready replica. Warmth is entirely controlled by `minReplicas`.
 
 ## Deploy to Azure Container Apps
 
@@ -492,10 +966,10 @@ azd up
 ```
 
 **What this does:**
-1. Builds Docker image
-2. Pushes to Azure Container Registry (created automatically)
-3. Deploys Bicep template (Container Apps, environment, ACR)
-4. Configures ingress, health checks, GPU allocation
+1. Runs `infra/main.bicep` — creates ACR, Storage Account + File Share, ACA Environment, and a Container App (with a placeholder image on first provision so ARM succeeds)
+2. Builds the Docker image using `Dockerfile.cpu` (native azd build — no manual `docker build` needed)
+3. Pushes the image to Azure Container Registry
+4. Updates the Container App to the real ACR image
 5. Outputs HTTPS URL
 
 **Output example:**
@@ -510,6 +984,26 @@ Use 'azd deploy' for subsequent updates
 - Infrastructure provisioning (~3-5 min)
 - Container image build & push (~1-2 min — small image, no model)
 - First request: model downloads ~7 GB into the Azure Files share (~5-10 min); subsequent requests are fast
+
+### Recovering from a failed first deploy
+
+If a previous `azd up` failed with `MANIFEST_UNKNOWN: manifest tagged by "latest" is not found`, the resource group may contain a half-created container app. This fix (placeholder image) prevents the error going forward, but if you hit it on a prior run, recover with one of these options:
+
+**Option A — least destructive (recommended):**
+```bash
+az containerapp delete --name sdxl-generation-api --resource-group rg-diberry-image --yes
+azd up
+```
+Deletes only the failed container app. Preserves the ACA environment, ACR, Storage, and Log Analytics (~1–2 min, no environment fee interruption).
+
+**Option B — full teardown:**
+```bash
+azd down --purge --force
+azd up
+```
+Destroys and rebuilds everything (~5–8 min). The dedicated D4 environment (~$70/mo) is not billed during teardown, but the Azure Files model cache is lost — first request after rebuild re-downloads ~7 GB from HuggingFace.
+
+**Recommendation:** Option A is cheaper and faster unless you need a completely clean slate.
 
 ### 3. Get Your API URL
 
@@ -653,15 +1147,16 @@ azd deploy
 ```
 
 **Scaling rules:**
-- **minReplicas: 0** — container stops when idle (no charges)
-- **maxReplicas: 1** — default; can handle 1 request at a time
-- **maxReplicas: 5** — can queue/handle up to 5 concurrent requests
+- **minReplicas: 0** (default) — container stops when idle (~$0 idle compute); ~6-min cold start on first request after idle
+- **minReplicas: 1** — always-warm replica; model stays in memory; no cold start; node runs 24/7
+- **maxReplicas: 1** (recommended) — caps cost at one D4 node; raise only if you need concurrent replicas (each additional replica adds a full D4 node cost)
 
-**Cost example (eastus region with 1 GPU vCPU):**
-- Idle: $0/hr
-- Generating (1 replica, 1 min): $0.005
-- Generating (5 min): $0.025
-- 100 batches/month, 5 min each: ~$12/month
+> **Note:** The readiness probe on `/health` lets ACA know when the model has finished loading — it does **not** keep the app warm or affect whether the container is running. Warmth is controlled by `minReplicas`.
+
+**Cost example (eastus region, approximate — verify via [Azure Pricing Calculator](https://azure.microsoft.com/pricing/calculator/)):**
+- Idle (minReplicas=0): ~$0/hr compute (dedicated env management fee still applies — see cost section below)
+- Active (D4 node, per hour): check current D4 dedicated pricing in your region
+- 100 batches/month at 5 min each with minReplicas=0: ~compute cost for ~8 hr active + management fee
 
 ### Monitor Logs
 
@@ -958,34 +1453,51 @@ azd deploy
 
 ## Cost Analysis
 
-### Local Development
-- **Electricity:** ~200W GPU × $0.12/kWh = ~$0.002 per 5-min batch
-- **Hardware amortization:** $5000 GPU / 60 months = $83/month (if using)
-- **Total:** $0–100/month depending on local compute
+### Local development
 
-### Azure Container Apps (eastus)
-- **GPU vCPU:** $0.30/hour active
-- **Compute + memory:** ~$0.04/hour
-- **Storage (model cache):** ~$1/month (10GB at $0.1/GB)
-- **Idle:** $0/month (scales to zero)
+Running SDXL locally requires a machine with enough RAM (12 GB+) and optionally a GPU. Cost depends entirely on your hardware.
 
-**Example: 100 batches/month, 5 min each:**
-- Total GPU time: 500 min = 8.33 hours
-- Cost: 8.33 × $0.34 = ~$2.83/month
-- Plus model storage: ~$1/month
-- **Total: ~$4/month**
+- **Electricity (CPU-only):** ~100–200W × $0.12/kWh ≈ $0.001–$0.002 per 5-min batch (approximate, varies by hardware)
+- **Electricity (GPU-assisted, if available):** similar wattage range; exact draw depends on GPU model
+- **Hardware amortization:** if you purchased dedicated hardware (e.g., $5,000 GPU workstation over 60 months ≈ $83/month)
+- **Total:** $0–100+/month depending on your hardware situation and usage volume
 
-### Cost Comparison
-| Scenario | Local | Azure |
-|----------|-------|-------|
-| 5 batches/week | $20/month | <$1/month |
-| Daily batches | $50/month | $5/month |
-| Always-on (100 req/day) | $150/month | $50/month |
+### Azure Container Apps
 
-**Azure wins** when:
-- Utilization is bursty (scale to zero)
-- You don't own a GPU
-- You need high concurrency (easy scaling)
+For Azure cost details, the single source of truth is [**Azure cost & scaling choices**](#azure-cost--scaling-choices) earlier in this document.
+
+Key facts to keep in mind:
+
+- SDXL CPU inference requires **Dedicated D4** (4 vCPU / 16 GiB); the Consumption plan's 8 GiB cap will very likely OOM.
+- The Dedicated environment carries a **management fee (~$70/mo, approximate, region-dependent)** that applies even at zero replicas — idle is not free.
+- With `minReplicas=0`: compute is ~$0 while idle (only management fee accrues); cold start ~6 min.
+- With `minReplicas=1`: the D4 node runs 24/7 — no cold start, but continuous node cost on top of the management fee.
+- Do not rely on per-image or per-hour figures from other SKUs (GPU, Consumption) — they do not apply to this CPU/D4 setup.
+
+Verify current Dedicated D4 pricing in the [Azure Pricing Calculator](https://azure.microsoft.com/pricing/calculator/).
+
+### Local vs Azure
+
+| Factor | Local (CPU or GPU) | Azure (Dedicated D4, CPU) |
+|--------|-------------------|--------------------------|
+| Upfront cost | Hardware purchase | None |
+| Idle cost | ~$0 compute (electricity only) | ~$70/mo management fee (always on) |
+| Active cost | Electricity (low) | D4 node-hours (see Pricing Calculator) |
+| Cold start | Immediate | ~6 min (if `minReplicas=0`) |
+| Availability | Limited to one machine | Accessible anywhere; up to `maxReplicas` nodes |
+| Scalability | Fixed to local hardware | Adjustable via `minReplicas`/`maxReplicas` |
+
+**Azure makes sense when:**
+- You don't own hardware capable of running SDXL (12 GB+ RAM)
+- Usage is bursty and infrequent — scale-to-zero keeps idle cost to just the ~$70/mo management fee
+- You need cloud-hosted inference without managing a physical machine
+
+**Local makes sense when:**
+- You already own hardware that can run SDXL
+- Usage is frequent enough that the Azure base cost (~$70/mo+) exceeds local electricity cost
+- You need zero cold-start latency and aren't concerned about availability outside your local network
+
+> All Azure figures are approximate and region-dependent. Verify current pricing in the [Azure Pricing Calculator](https://azure.microsoft.com/pricing/calculator/).
 
 ## Production Checklist
 

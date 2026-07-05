@@ -15,7 +15,13 @@
       "value": "sdxlregistry"
     },
     "imageName": {
-      "value": "sdxl-api:latest"
+      "value": "${SERVICE_API_IMAGE_NAME=}"
+    },
+    "minReplicas": {
+      "value": "${AZURE_MIN_REPLICAS=0}"
+    },
+    "maxReplicas": {
+      "value": "${AZURE_MAX_REPLICAS=1}"
     }
   }
 }
