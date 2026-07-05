@@ -16,16 +16,15 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.cpu
+    # Dockerfile.cpu now defaults to the Flask HTTP server (ACA entrypoint).
+    # Override the entrypoint here so CLI batch runs work locally.
     working_dir: /data
+    entrypoint: ["python", "-m", "image_generation.generate"]
     volumes:
       # Bind-mount the current directory so batch files and outputs are visible on the host.
       - ./:/data:rw
       # Persistent model cache — downloaded once, reused on every subsequent run.
       - hf-cache:/root/.cache/huggingface
-    # entrypoint and default CMD are set in Dockerfile.cpu:
-    #   ENTRYPOINT ["python", "-m", "image_generation.generate"]
-    #   CMD ["--help"]
-    #
     # Example:
     #   docker compose run --rm img-gen --batch-file /data/batch.json
 

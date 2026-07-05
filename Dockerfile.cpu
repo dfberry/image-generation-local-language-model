@@ -1,10 +1,15 @@
-# CPU-only CLI image — no GPU required, no model baked in.
+# CPU-only image — no GPU required, no model baked in.
+# Default: runs the Flask HTTP API server (port 8000). This is the image deployed to ACA.
 # Model downloads on first run into a persistent cache volume (download once, reuse every run).
-# Usage (via docker compose — recommended):
-#   docker compose build
+#
+# ACA deployment (azure.yaml → this Dockerfile):
+#   azd up
+#
+# Local CLI batch use — entrypoint is overridden in docker-compose.yml (img-gen service):
 #   docker compose run --rm img-gen --batch-file /data/batch.json
+#
 # Direct build:
-#   docker build -f Dockerfile.cpu -t sdxl-cli:cpu .
+#   docker build -f Dockerfile.cpu -t sdxl-cpu .
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -38,11 +43,10 @@ RUN pip install --upgrade pip setuptools wheel && \
 COPY app.py .
 COPY src/ ./src/
 
-# /data is the working directory for batch files and outputs.
-# Mount the host directory here: docker run --mount type=bind,source=$(pwd),target=/data ...
-# The hf-cache named volume is mounted at HF_HOME so the model is downloaded once and reused.
-WORKDIR /data
+WORKDIR /app
 VOLUME ["/data"]
 
-ENTRYPOINT ["python", "-m", "image_generation.generate"]
-CMD ["--help"]
+# Default: run the Flask HTTP API (this image is the ACA "HTTP door").
+# Local CLI batch use overrides the entrypoint — see docker-compose.yml (img-gen service).
+EXPOSE 8000
+ENTRYPOINT ["python", "app.py"]
