@@ -76,20 +76,38 @@ def health_check():
 def generate_endpoint():
     """
     POST /generate
-    
-    Request JSON:
+
+    Accepts two request shapes:
+
+    Flat form — settings at root level:
     {
-        "prompts": [
-            {"prompt": "a tropical sunset", "seed": 42, "output": "sunset.png"},
-            {"prompt": "underwater scene", "seed": 43}
-        ],
+        "prompts": [...],
         "steps": 40,
         "guidance": 7.5,
         "width": 1024,
         "height": 1024,
-        "refine": false
+        "refine": false,
+        "cpu": false
     }
-    
+
+    Object form — globals nested under a "settings" key (CLI batch.json verbatim).
+    An optional top-level "description" field is ignored. Root-level keys always
+    override matching keys inside "settings":
+    {
+        "description": "optional, ignored",
+        "settings": {
+            "steps": 30,
+            "guidance": 9.0,
+            "width": 768,
+            "height": 768,
+            "refine": true,
+            "cpu": false
+        },
+        "prompts": [...]
+    }
+
+    Resolution precedence: explicit root value > nested settings value > built-in default.
+
     Response JSON:
     {
         "status": "success",
@@ -127,14 +145,25 @@ def generate_endpoint():
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }), 400
         
-        # Extract parameters with defaults
+        # Support object-form: globals nested under "settings" (CLI batch.json).
+        # Root-level keys always win over nested settings values.
+        settings = config["settings"] if isinstance(config.get("settings"), dict) else {}
+
+        def _resolve(key, default):
+            if key in config:
+                return config[key]
+            if key in settings:
+                return settings[key]
+            return default
+
+        # Extract parameters with defaults (root > settings > default)
         prompts = config.get("prompts", [])
-        steps = int(config.get("steps", 40))
-        guidance = float(config.get("guidance", 7.5))
-        width = int(config.get("width", 1024))
-        height = int(config.get("height", 1024))
-        refine = config.get("refine", False)
-        use_cpu = config.get("cpu", False)
+        steps = int(_resolve("steps", 40))
+        guidance = float(_resolve("guidance", 7.5))
+        width = int(_resolve("width", 1024))
+        height = int(_resolve("height", 1024))
+        refine = _resolve("refine", False)
+        use_cpu = _resolve("cpu", False)
         
         # Validate numeric ranges
         if steps < 1 or steps > 150:

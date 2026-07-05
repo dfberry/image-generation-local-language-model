@@ -683,7 +683,14 @@ To eliminate cold starts at the cost of 24/7 D4 compute, set `minReplicas=1` —
 
 ### Request body format
 
-The server reads a **flat JSON object** — settings live at the **top level**. There is no nested `settings` block and no `description` field (both belong to the CLI batch file format only):
+The server accepts **two request shapes** — pick whichever is convenient:
+
+- **Flat form** — settings at the JSON root (original format).
+- **Object form** — settings nested under a `"settings"` key, with an optional top-level `"description"` (identical to the CLI `batch.json` layout). The server reads both shapes; `description` is harmless and ignored.
+
+**Precedence when both appear:** root-level key → nested `settings` value → built-in default.
+
+**Flat form example:**
 
 ```json
 {
@@ -717,11 +724,51 @@ The server reads a **flat JSON object** — settings live at the **top level**. 
 | `height` | Must be exactly 512, 768, or 1024 |
 | `prompts` | Must be present and non-empty |
 
-### Converting a local batch.json to a cloud request
+### Sending your batch.json to the cloud
 
-The CLI **object-form** `batch.json` uses a nested `settings` block and an optional `description` key — neither is read by the server. To reuse your batch file against the cloud API, **flatten** it:
+> **Can I send `batch.json` as-is?**
+> **Yes — send it verbatim.** The server accepts the object form directly: your `settings` block **is** honored, `description` is ignored, and all `prompts` (including `seed`, `output`, `negative_prompt`) are used. Flattening is no longer required.
+>
+> If you include a key both at the root and inside `settings`, the root-level value wins.
 
-**Before — CLI batch.json (object form with nested `settings`):**
+#### Send batch.json directly (no conversion needed)
+
+Set your FQDN first (same value used in the **Send the request** section):
+
+**bash / curl.exe:**
+
+```bash
+FQDN="sdxl-generation-api.victoriousforest-12ab.eastus.azurecontainerapps.io"
+
+curl.exe -X POST "https://$FQDN/generate" \
+  -H "Content-Type: application/json" \
+  --data-binary "@batch.json"
+```
+
+**PowerShell:**
+
+```powershell
+$fqdn = "sdxl-generation-api.victoriousforest-12ab.eastus.azurecontainerapps.io"
+
+Invoke-RestMethod -Uri "https://$fqdn/generate" -Method Post `
+  -ContentType "application/json" -InFile "batch.json"
+```
+
+> **Timing note:** `batch.json`'s default settings (40 steps, 1024×1024, CPU) take roughly 6 minutes per image on a cloud CPU container. If `minReplicas=0`, poll `/health` first and wait for a `200` before sending (cold start can add 2–3 minutes).
+
+After sending, decode and save the returned images. Each `ok` result includes `image_base64` (base64 PNG bytes) and `filename` (basename). See **[Retrieving generated images](#retrieving-generated-images)** below for the bash/jq and PowerShell save loops that iterate all results and write each file by `filename`.
+
+#### Optional: flatten to a minimal flat body
+
+Flattening is only needed if you want the smallest possible request payload. One-liner with `jq`:
+
+```bash
+jq '{prompts: .prompts} + .settings' batch.json > cloud-request.json
+```
+
+This lifts the `settings` keys to the root, keeps `prompts`, and drops `description`. Then send with `--data-binary "@cloud-request.json"`.
+
+**Original batch.json (object form):**
 
 ```json
 {
@@ -739,7 +786,7 @@ The CLI **object-form** `batch.json` uses a nested `settings` block and an optio
 }
 ```
 
-**After — cloud-request.json (flat, server-ready):**
+**Equivalent flat form (optional):**
 
 ```json
 {
@@ -753,8 +800,6 @@ The CLI **object-form** `batch.json` uses a nested `settings` block and an optio
   "refine": false
 }
 ```
-
-Move the keys out of `settings` up to the top level; drop `description`; remove the now-empty `settings` key.
 
 ### Send the request
 
