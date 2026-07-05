@@ -801,6 +801,31 @@ This lifts the `settings` keys to the root, keeps `prompts`, and drops `descript
 }
 ```
 
+### One-command client script
+
+The scripts below wrap the full workflow — cold-start polling, POST, and saving every returned image — into a single command. Pass the container-app **root URL** (no `/generate` suffix), a local batch file, and an optional output directory.
+
+**bash** (requires `jq`):
+
+```bash
+./scripts/generate-cloud.sh https://<app-root> batch.json ./outputs
+```
+
+**PowerShell** (pwsh or Windows PowerShell):
+
+```powershell
+./scripts/generate-cloud.ps1 -Url https://<app-root> -BatchFile batch.json -OutputDir ./outputs
+```
+
+Both scripts:
+1. Strip any trailing `/` from the URL, then build `<root>/health` and `<root>/generate`.
+2. Poll `GET /health` up to 20 times (15 s apart) waiting for an HTTP 200 — handles ACA scale-to-zero cold starts (~2–6 min).
+3. POST the batch file bytes verbatim (`Content-Type: application/json`) with a 30-minute timeout.
+4. For each `ok` result, base64-decode `image_base64` and write it to `<output-dir>/<filename>`.
+5. Print a `<N> saved, <M> failed` summary and exit non-zero if any image failed.
+
+> **bash note:** `jq` must be on `PATH`. Install with `brew install jq` (macOS) or `sudo apt-get install jq` (Ubuntu/Debian).
+
 ### Send the request
 
 > ⚠️ **PowerShell users:** In PowerShell, `curl` is an alias for `Invoke-WebRequest` and does **not** accept `-H` or `-d`. Passing those flags fails with `"The term '-H' is not recognized"`. Use `Invoke-RestMethod` or call `curl.exe` explicitly (the real curl binary).
@@ -870,6 +895,8 @@ Each `ok` result now includes the image bytes base64-encoded in `image_base64`. 
 Non-`ok` results have `image_base64: null` and no `filename` or `content_type`.
 
 ### Retrieving generated images
+
+> For a ready-made client that handles cold-start polling and saves all images automatically, see **[One-command client script](#one-command-client-script)** above.
 
 `/generate` returns each PNG **inline as base64** in the result's `image_base64` field. The server reads the file bytes and encodes them in the same request before responding, so images are available to callers even though `/app/outputs` is on the container's ephemeral filesystem and is not mounted to Azure Files.
 
