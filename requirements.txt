@@ -6,7 +6,7 @@ tokenizers==0.19.1
 accelerate==0.33.0
 safetensors==0.4.5
 invisible-watermark==0.2.0
-opencv-python==4.11.0.86
+opencv-python-headless==4.11.0.86
 PyWavelets==1.9.0
 torch==2.1.2
 Pillow==10.2.0
