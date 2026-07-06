@@ -99,7 +99,9 @@ Or by name: `docker volume ls` then `docker volume rm <project>_hf-cache`.
 
 ### Layer 3 — Cloud (Azure Container Apps)
 
-`azd up` provisions Azure infrastructure (ACR, Storage, ACA Environment, Container App), then builds the Docker image using `Dockerfile.cpu`, pushes it to Azure Container Registry, and updates the Container App to the real image — all in one command. On the very first deploy, the Container App provisions with a harmless placeholder image so ARM succeeds before the ACR is populated; azd then swaps in the real image during the deploy phase.
+`azd up` provisions Azure infrastructure (ACR, Storage, ACA Environment, Container App), then builds the Docker image using `Dockerfile`, pushes it to Azure Container Registry, and updates the Container App to the real image — all in one command. On the very first deploy, the Container App provisions with a harmless placeholder image so ARM succeeds before the ACR is populated; azd then swaps in the real image during the deploy phase.
+
+> **Brand-new environment? Run `azd up` then `azd provision`.** On a fresh environment the placeholder is created with `apiExists=false`, and azd's deploy phase swaps only the *image* — not the container's startup command. A second `azd provision` flips `apiExists=true` and applies the real Flask command (`python3 app.py`). Without it, the base URL shows a Python `http.server` directory listing instead of the API. On an *existing* environment a plain `azd up` is enough. See [Deploy to Azure Container Apps](#deploy-to-azure-container-apps).
 
 **Persistent model storage via Azure Files:**
 
@@ -1098,9 +1100,18 @@ When prompted:
 azd up
 ```
 
+> **⚠️ First deploy to a brand-new environment needs two commands:**
+>
+> ```console
+> azd up          # provisions infra + placeholder, builds & pushes the real image
+> azd provision   # flips apiExists=true → applies the real Flask command
+> ```
+>
+> On a fresh environment the app is first provisioned with `apiExists=false` (placeholder image **and** placeholder command `python3 -m http.server 8000`). The `azd up` deploy phase swaps in the real image but **not** the command, so the app would serve a directory listing at `/`. The follow-up `azd provision` sets the real command (`python3 app.py`) and the API comes up correctly. On an **existing** environment, a single `azd up` is sufficient.
+
 **What this does:**
 1. Runs `infra/main.bicep` — creates ACR, Storage Account + File Share, ACA Environment, and a Container App (with a placeholder image on first provision so ARM succeeds)
-2. Builds the Docker image using `Dockerfile.cpu` (native azd build — no manual `docker build` needed)
+2. Builds the Docker image using `Dockerfile` (native azd build — no manual `docker build` needed)
 3. Pushes the image to Azure Container Registry
 4. Updates the Container App to the real ACR image
 5. Outputs HTTPS URL
