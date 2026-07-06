@@ -21,13 +21,9 @@ infra:
   module: main
 
 hooks:
-  predeploy:
-    shell: sh
-    continueOnError: false
-    run: |
-      echo "Building Docker image..."
-      docker build -t ${AZURE_CONTAINER_REGISTRY_ENDPOINT}/sdxl-api:latest .
-      echo "Docker image built successfully"
+  # predeploy hook removed: azd builds and pushes the Docker image automatically
+  # via the services.api.docker block above. A manual docker build here was
+  # redundant and would re-tag with :latest instead of azd's deploy tag.
   postdeploy:
     shell: sh
     continueOnError: true
