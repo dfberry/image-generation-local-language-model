@@ -48,7 +48,7 @@ The service is built in three layers: application code, a Docker container, and 
 |---|---|---|---|
 | **Application** | First `run` (CLI) or first `POST /generate` (server) — lazy, on demand | Same invocation that triggered the download; stays resident for the process lifetime | Persists in the mounted cache volume across runs |
 | **Container** | **Not at build time.** First `docker compose run` downloads ~7 GB into the `hf-cache` named volume | After download, loads from volume into CPU/GPU RAM — first run is slow; all later runs are fast | Volume survives container removal; only lost if the named volume is deleted |
-| **Cloud (ACA)** | First request to a fresh replica if the Azure Files share is empty; skipped on subsequent starts if the share is populated | Loads from the Azure Files share into GPU RAM on each container start | Azure Files share persists across scale-to-zero; shared across all replicas |
+| **Cloud (ACA)** | Lazily, on the first `POST /model/pull` or `/generate` if the Azure Files share is empty; skipped once the share is populated | Loads from the Azure Files share into CPU RAM on the first request (not at startup) | Azure Files share persists across restarts and revisions; shared across all replicas |
 
 ### Layer 1 — Application
 
@@ -105,15 +105,15 @@ Or by name: `docker volume ls` then `docker volume rm <project>_hf-cache`.
 
 **Persistent model storage via Azure Files:**
 
-The same pattern that works locally with a named volume works on ACA with an Azure Files share. Mount the share at `/root/.cache/huggingface` (= `HF_HOME`) on every replica. The model downloads once (first cold start) and persists across scale-to-zero and across all replicas.
+The same pattern that works locally with a named volume works on ACA with an Azure Files share. Mount the share at `/root/.cache/huggingface` (= `HF_HOME`) on every replica. The model downloads once (lazily, on the first `/model/pull` or `/generate`) and persists across container restarts and new revisions, shared across all replicas.
 
 **Recommended production setup:**
 
-1. **Azure Files NFS share** mounted at `/root/.cache/huggingface` on the Container App. See `/azure/container-apps/storage-mounts`.
+1. **Azure Files SMB share** mounted at `/root/.cache/huggingface` on the Container App. This repo's `infra/resources/storage.bicep` provisions a `Standard_LRS` account + `models` share, registered on the ACA environment as `models-storage`. See `/azure/container-apps/storage-mounts`.
 
-2. **Optional: init container** to pre-warm the share before the main container starts. Run `scripts/download_model.py` as an init container — on the very first deploy it downloads ~7 GB; on all subsequent starts it detects weights already present and exits immediately. See `/azure/container-apps/init-containers`.
+2. **Optional: init container** to pre-warm the share before the main container starts. Run `scripts/download_model.py` as an init container — on the very first deploy it downloads ~13 GB; on all subsequent starts it detects weights already present and exits immediately. See `/azure/container-apps/init-containers`.
 
-3. **Set `minReplicas: 0`** (default) to reduce cost — the container stops when idle. First request after idle triggers a cold start: the model must reload from the Azure Files share into memory (~6 min typical on CPU). Set `minReplicas: 1` to keep one warm replica loaded and avoid cold-start delay, at the cost of running the D4 node 24/7.
+3. **Replicas are fixed at `minReplicas: 1` / `maxReplicas: 1`** (dedicated D4 cannot scale to zero). One replica is always warm; the model loads lazily into memory on the first `/model/pull` or `/generate` after a container restart or new revision (~6 min on CPU), not at startup.
 
 4. **Add a readiness probe** on `/health` so ACA only routes traffic once the model is in memory:
 
@@ -134,10 +134,10 @@ See `/azure/container-apps/health-probes` for ACA probe configuration reference.
 
 | | Local (docker compose) | ACA |
 |---|---|---|
-| Storage backing | Docker named volume (`hf-cache`) | Azure Files share (NFS preferred) |
+| Storage backing | Docker named volume (`hf-cache`) | Azure Files SMB share |
 | Mount path | `/root/.cache/huggingface` | `/root/.cache/huggingface` (same) |
 | Populate | First `docker compose run` | Init container or lazy first request |
-| Survives container restart | ✅ | ✅ (scale-to-zero safe) |
+| Survives container restart | ✅ | ✅ (persists across restarts + revisions) |
 | Shared across replicas | N/A | ✅ |
 
 ## Prerequisites
@@ -658,9 +658,9 @@ az containerapp show -n sdxl-generation-api -g rg-diberry-image `
 
 Your generate endpoint is then `https://<fqdn>/generate`.
 
-### ⚠️ Cold start — set a long client timeout
+### ⚠️ First-request model load — set a long client timeout
 
-With `minReplicas=0` (the default), the container stops when idle. The first request after an idle period triggers a cold start: container boot + loading the ~7 GB model from the Azure Files share ≈ **~6 minutes**. Your HTTP client must tolerate this latency.
+The container is always warm (`minReplicas=1` fixed — dedicated D4 has no scale-to-zero), but the ~7 GB model is **not** loaded at startup. The first `POST /generate` (or `/model/pull`) after a container restart or new revision loads it from the Azure Files share into memory ≈ **~6 minutes**. `GET /health` returns `healthy` immediately and does **not** reflect model readiness, so your HTTP client must tolerate this first-request latency — or pre-warm via `/model/pull` (see below).
 
 **Recommended workflow — poll `/health` before sending prompts:**
 
@@ -730,7 +730,7 @@ The server accepts **two request shapes** — pick whichever is convenient:
 
 ### Pre-warming the model (optional but recommended)
 
-Azure Container Apps scales to zero when idle. When the app wakes from zero, the very first `/generate` request must download the ~7 GB SDXL model into the Azure Files cache before work can begin — this adds roughly 6 minutes of latency inline to that first request. Pre-warming lets you trigger that download deliberately in the background, poll until it finishes, and then send your real batch to a warm cache. Pre-warming is optional: `/generate` still works without it and will absorb the cold-start download itself.
+The ~7 GB SDXL model is loaded lazily. The very first `/generate` after a container restart or new revision must download (if the share is empty) and load the model into memory before work can begin — this adds roughly 6 minutes of latency inline to that first request. Pre-warming lets you trigger that load deliberately in the background, poll `/model/status` until it finishes, and then send your real batch to a warm model. Pre-warming is optional: `/generate` still works without it and will absorb the first-load latency itself.
 
 **Step 1 — kick off the pull (returns 202 immediately):**
 
@@ -807,7 +807,7 @@ Invoke-RestMethod -Uri "https://$fqdn/generate" -Method Post `
   -ContentType "application/json" -InFile "batch.json"
 ```
 
-> **Timing note:** `batch.json`'s default settings (40 steps, 1024×1024, CPU) take roughly 6 minutes per image on a cloud CPU container. If `minReplicas=0`, poll `/health` first and wait for a `200` before sending (cold start can add 2–3 minutes).
+> **Timing note:** `batch.json`'s default settings (40 steps, 1024×1024, CPU) take roughly 6 minutes per image on a cloud CPU container. On the first request after a restart/new revision, the lazy model load adds ~6 minutes inline; pre-warm via `/model/pull` and poll `/model/status` first (see [Pre-warming the model](#pre-warming-the-model-optional-but-recommended)) to keep that delay off your `/generate` call.
 
 After sending, decode and save the returned images. Each `ok` result includes `image_base64` (base64 PNG bytes) and `filename` (basename). See **[Retrieving generated images](#retrieving-generated-images)** below for the bash/jq and PowerShell save loops that iterate all results and write each file by `filename`.
 
@@ -872,7 +872,7 @@ The scripts below wrap the full workflow — cold-start polling, POST, and savin
 
 Both scripts:
 1. Strip any trailing `/` from the URL, then build `<root>/health` and `<root>/generate`.
-2. Poll `GET /health` up to 20 times (15 s apart) waiting for an HTTP 200 — handles ACA scale-to-zero cold starts (~2–6 min).
+2. Poll `GET /health` up to 20 times (15 s apart) waiting for an HTTP 200 — confirms the container is reachable. Note: `/health` does **not** reflect model-load state; use `--warmup` to wait on the model itself.
 3. POST the batch file bytes verbatim (`Content-Type: application/json`) with a 30-minute timeout.
 4. For each `ok` result, base64-decode `image_base64` and write it to `<output-dir>/<filename>`.
 5. Print a `<N> saved, <M> failed` summary and exit non-zero if any image failed.
@@ -1009,7 +1009,7 @@ foreach ($result in $resp.results) {
 
 ### 6. Cloud: ACA + Azure Files
 
-The same pattern that works locally with the `hf-cache` named volume maps directly to Azure Container Apps with an Azure Files share. Mount the share at `/root/.cache/huggingface` — model downloads once into the share, persists across scale-to-zero, shared across all replicas.
+The same pattern that works locally with the `hf-cache` named volume maps directly to Azure Container Apps with an Azure Files share. Mount the share at `/root/.cache/huggingface` — model downloads once into the share, persists across restarts and revisions, shared across all replicas.
 
 - See `/azure/container-apps/storage-mounts` to attach an Azure Files share.
 - See `/azure/container-apps/init-containers` to pre-warm the share with `scripts/download_model.py` before the main container starts.
@@ -1017,10 +1017,10 @@ The same pattern that works locally with the `hf-cache` named volume maps direct
 
 | | Local (docker compose) | ACA |
 |---|---|---|
-| Model storage | `hf-cache` named volume | Azure Files NFS share |
+| Model storage | `hf-cache` named volume | Azure Files SMB share |
 | Mount path | `/root/.cache/huggingface` | `/root/.cache/huggingface` |
 | Model download | First `docker compose run` | First ACA start (init container or lazy) |
-| Survives restart | ✅ | ✅ (scale-to-zero safe) |
+| Survives restart | ✅ | ✅ (persists across restarts + revisions) |
 | Shared across replicas | N/A | ✅ |
 
 ## Azure cost & scaling choices
@@ -1039,22 +1039,23 @@ A dedicated profile environment carries an **environment management fee** (~$70/
 
 ### Scaling parameters
 
-`minReplicas` and `maxReplicas` are set via `azd` environment variables — the Bicep reads them through `infra/parameters.json` (`AZURE_MIN_REPLICAS`, default `0`; `AZURE_MAX_REPLICAS`, default `1`). Note: `azd up` does **not** accept a `--parameters` flag. Set the values, then deploy:
+`minReplicas` and `maxReplicas` are **hardcoded to `1` / `1`** in `infra/resources/aca.bicep`. The container app runs on the **dedicated D4 workload profile, which does not support scale-to-zero** — the minimum is one always-warm replica. There are no `AZURE_MIN_REPLICAS` / `AZURE_MAX_REPLICAS` azd environment variables; to change replica counts, edit the `scale` block in `aca.bicep` directly and re-run `azd provision`:
 
-```console
-azd env set AZURE_MIN_REPLICAS 1
-azd env set AZURE_MAX_REPLICAS 1   # default is 1
-azd up
+```bicep
+// infra/resources/aca.bicep
+scale: {
+  minReplicas: 1   // dedicated D4 minimum; cannot be 0
+  maxReplicas: 1   // raise to fan out (each replica = one more D4 node)
+}
 ```
 
-> `azd env set` alone does not redeploy — you must follow with `azd up` for the change to take effect.
+> Because there is always ≥1 warm replica, there is **no scale-to-zero cold start**. The only first-request latency is the lazy model load on the first `/model/pull` or `/generate` (the ~13 GB model isn't loaded at container startup — `/health` returns immediately regardless).
 
 ### Cost choices at a glance
 
 | Choice | Effect | Cost direction |
 |---|---|---|
-| `minReplicas=0` (default) | Scale-to-zero: ~$0 idle compute; ~6-min cold start on first request after idle | ↓ cheapest |
-| `minReplicas=1` | Always-warm: no cold start; model stays in memory; D4 node runs 24/7 | ↑ highest compute cost |
+| `minReplicas=1` (fixed default) | Always-warm: one D4 node runs 24/7; no scale-to-zero on dedicated profiles | fixed baseline |
 | `maxReplicas=1` (default) | Caps fan-out; never pay for more than one D4 node at a time | ↓ recommended |
 | `maxReplicas > 1` | Each additional replica spins up a full D4 node | ↑ multiplies node cost |
 | Dedicated D4 profile | 4 vCPU / 16 GiB — reliable for SDXL; carries environment management fee (~$70/mo approx) | ↑ fixed overhead |
@@ -1062,20 +1063,17 @@ azd up
 
 > All dollar figures are approximate and region-dependent. Verify current pricing in the [Azure Pricing Calculator](https://azure.microsoft.com/pricing/calculator/).
 
-### Recommended: cheapest-that-works
+### Recommended: the shipped default
 
-**Dedicated D4, `minReplicas=0`, `maxReplicas=1`** — these are already the defaults.
+**Dedicated D4, `minReplicas=1`, `maxReplicas=1`** — hardcoded in `aca.bicep`.
 
-- You pay the ~$70/mo environment management fee regardless of activity.
-- Compute cost accrues only while a replica is running (active generation).
-- Cold start after idle: container starts, model loads from Azure Files share into memory (~6 min typical).
+- You pay the ~$70/mo environment management fee **plus** one D4 node running continuously (dedicated profiles cannot scale to zero).
+- No cold start from idle — the replica is always warm. The only first-request delay is the lazy model load (~6 min on CPU) on the first `/generate`/`/model/pull` after a container restart or new revision.
 - No surprise fan-out: `maxReplicas=1` means at most one D4 node is ever running.
 
-### Always-warm alternative
+### Reducing cost when not in use
 
-Set `minReplicas=1`. The D4 node runs 24/7 — no cold start, model stays in memory. The additional cost is one D4 node running continuously. Use this if cold-start latency is unacceptable.
-
-> **The readiness probe on `/health` does NOT keep the app warm.** It tells ACA when the model has finished loading after a cold start, so traffic is only routed to a ready replica. Warmth is entirely controlled by `minReplicas`.
+Since the dedicated D4 node runs 24/7, the effective way to stop paying for compute is to tear the environment down with `azd down --force --purge` when you're done testing, and `azd up` again when you need it. The Azure Files model cache is lost on teardown (first request re-downloads ~13 GB).
 
 ## Deploy to Azure Container Apps
 
@@ -1107,7 +1105,17 @@ azd up
 > azd provision   # flips apiExists=true → applies the real Flask command
 > ```
 >
-> On a fresh environment the app is first provisioned with `apiExists=false` (placeholder image **and** placeholder command `python3 -m http.server 8000`). The `azd up` deploy phase swaps in the real image but **not** the command, so the app would serve a directory listing at `/`. The follow-up `azd provision` sets the real command (`python3 app.py`) and the API comes up correctly. On an **existing** environment, a single `azd up` is sufficient.
+> On a fresh environment the app is first provisioned with `apiExists=false` (placeholder image **and** placeholder command `python3 -m http.server 8000`). The `azd up` deploy phase swaps in the real image but **not** the command, so the app would serve a directory listing at `/`. The follow-up `azd provision` sets the real command (`python3 app.py`) and the API comes up correctly.
+>
+> On an **existing** environment a single `azd up` is *usually* sufficient — **but first confirm the exists flag is set**, or the app relapses to the placeholder directory listing:
+>
+> ```console
+> azd env get-value SERVICE_API_RESOURCE_EXISTS   # if this prints "false" for an app that already exists:
+> azd env set SERVICE_API_RESOURCE_EXISTS true
+> azd up
+> ```
+>
+> azd normally manages this flag automatically after the first successful deploy — this only works because `infra/main.parameters.json` wires `apiExists=${SERVICE_API_RESOURCE_EXISTS}`. If that file is missing, `apiExists` is always `false` and the app is permanently stuck on the placeholder command.
 
 **What this does:**
 1. Runs `infra/main.bicep` — creates ACR, Storage Account + File Share, ACA Environment, and a Container App (with a placeholder image on first provision so ARM succeeds)
@@ -1291,16 +1299,15 @@ azd deploy
 ```
 
 **Scaling rules:**
-- **minReplicas: 0** (default) — container stops when idle (~$0 idle compute); ~6-min cold start on first request after idle
-- **minReplicas: 1** — always-warm replica; model stays in memory; no cold start; node runs 24/7
-- **maxReplicas: 1** (recommended) — caps cost at one D4 node; raise only if you need concurrent replicas (each additional replica adds a full D4 node cost)
+- **minReplicas: 1** (fixed) — the dedicated D4 profile cannot scale to zero, so one replica always runs; the D4 node bills 24/7.
+- **maxReplicas: 1** (fixed) — caps cost at one D4 node. To allow concurrent replicas, edit the `scale` block in `infra/resources/aca.bicep` (each extra replica is a full D4 node) and re-run `azd provision`.
 
-> **Note:** The readiness probe on `/health` lets ACA know when the model has finished loading — it does **not** keep the app warm or affect whether the container is running. Warmth is controlled by `minReplicas`.
+> **Note:** Both values are hardcoded in `infra/resources/aca.bicep` — there are no `AZURE_MIN_REPLICAS` / `AZURE_MAX_REPLICAS` env vars. The readiness probe on `/health` tells ACA the container is up; it does **not** keep the app warm (warmth is inherent with `minReplicas=1`) and does **not** reflect model-load state.
 
 **Cost example (eastus region, approximate — verify via [Azure Pricing Calculator](https://azure.microsoft.com/pricing/calculator/)):**
-- Idle (minReplicas=0): ~$0/hr compute (dedicated env management fee still applies — see cost section below)
-- Active (D4 node, per hour): check current D4 dedicated pricing in your region
-- 100 batches/month at 5 min each with minReplicas=0: ~compute cost for ~8 hr active + management fee
+- Baseline (always-on): ~$70/mo dedicated env management fee **plus** one D4 node running 24/7.
+- Active generation: no extra node cost at `maxReplicas=1` — the single warm node does the work.
+- To stop paying compute: `azd down --force --purge` when idle for long periods (this loses the cached model).
 
 ### Monitor Logs
 
@@ -1614,8 +1621,8 @@ Key facts to keep in mind:
 
 - SDXL CPU inference requires **Dedicated D4** (4 vCPU / 16 GiB); the Consumption plan's 8 GiB cap will very likely OOM.
 - The Dedicated environment carries a **management fee (~$70/mo, approximate, region-dependent)** that applies even at zero replicas — idle is not free.
-- With `minReplicas=0`: compute is ~$0 while idle (only management fee accrues); cold start ~6 min.
-- With `minReplicas=1`: the D4 node runs 24/7 — no cold start, but continuous node cost on top of the management fee.
+- `minReplicas=1` is fixed (dedicated D4 has no scale-to-zero): the D4 node runs 24/7, so continuous node cost accrues on top of the ~$70/mo management fee even when idle.
+- To stop compute charges, tear down with `azd down --force --purge` when the app isn't in use (this also drops the cached model).
 - Do not rely on per-image or per-hour figures from other SKUs (GPU, Consumption) — they do not apply to this CPU/D4 setup.
 
 Verify current Dedicated D4 pricing in the [Azure Pricing Calculator](https://azure.microsoft.com/pricing/calculator/).
@@ -1627,13 +1634,13 @@ Verify current Dedicated D4 pricing in the [Azure Pricing Calculator](https://az
 | Upfront cost | Hardware purchase | None |
 | Idle cost | ~$0 compute (electricity only) | ~$70/mo management fee (always on) |
 | Active cost | Electricity (low) | D4 node-hours (see Pricing Calculator) |
-| Cold start | Immediate | ~6 min (if `minReplicas=0`) |
+| Cold start | Immediate | None — always warm; first request adds ~6 min lazy model load |
 | Availability | Limited to one machine | Accessible anywhere; up to `maxReplicas` nodes |
 | Scalability | Fixed to local hardware | Adjustable via `minReplicas`/`maxReplicas` |
 
 **Azure makes sense when:**
 - You don't own hardware capable of running SDXL (12 GB+ RAM)
-- Usage is bursty and infrequent — scale-to-zero keeps idle cost to just the ~$70/mo management fee
+- Usage is bursty and infrequent — tear down (`azd down --force --purge`) between bursts, since the D4 node bills 24/7 while provisioned (no scale-to-zero on dedicated profiles)
 - You need cloud-hosted inference without managing a physical machine
 
 **Local makes sense when:**
