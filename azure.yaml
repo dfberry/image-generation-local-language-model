@@ -7,8 +7,9 @@ services:
     project: .
     language: python
     host: containerapp
-    dockerfile: Dockerfile
-    port: 8000
+    docker:
+      path: ./Dockerfile
+      context: .
 
 metadata:
   version: 1.0.0
@@ -17,8 +18,7 @@ metadata:
 
 infra:
   path: infra
-  template: main.bicep
-  parameters: infra/parameters.json
+  module: main
 
 hooks:
   predeploy:
