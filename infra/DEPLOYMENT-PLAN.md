@@ -155,3 +155,58 @@ The Dedicated D4 workload profile (`minimumCount: 1`) means **one D4 node is alw
 **Run `azd down --purge` when not using the environment** to avoid ongoing charges. `--purge` ensures the ACR and Log Analytics workspace are fully deleted rather than soft-deleted.
 
 ACR name is `sdxlregistry${uniqueString(resourceGroup().id)}` — deterministic per resource group, so it will not conflict across environments or re-creates of the same RG.
+
+---
+
+## Runtime Fixes — Post-First-Deploy (2026-07-05)
+
+These two issues were only visible at actual deploy runtime — bicep validation and preflight checks cannot catch them.
+
+### RF-1 — Workload-profile node-count deadlock
+
+**Symptom:** Repeated system events: `"The workload profile has reached its maximum node count. Please increase maximum node count."` + `AssigningReplicaFailed` / `Waiting for infrastructure to be ready`. The container app would never transition from the placeholder revision to the real revision.
+
+**Root cause:** `dedicated-d4` profile was `minimumCount: 1, maximumCount: 1` — exactly one D4 node ever. Each D4 node holds exactly one container (4 vCPU / 16 Gi per container = one full node). During a rolling revision handoff, ACA starts the NEW revision's replica before retiring the old one:
+
+```
+Node 1: placeholder revision (still Running) ← occupying the only node
+Node ?:  real (azd-…) revision              ← no node available → never starts
+```
+
+In Single revision mode ACA won't retire the placeholder until the new revision is healthy. But the new revision can't start without a free node. **Permanent deadlock.**
+
+**Live hotfix applied (2026-07-05):** `az containerapp env workload-profile update --name sdxl-env --resource-group rg-diberry-image3 --profile-name dedicated-d4 --max-nodes 2`
+
+**Durable fix (`aca-env.bicep`):** `maximumCount: 2` — two D4 nodes. The transient overlap of old + new revision during every rolling update now has room.
+
+---
+
+### RF-2 — Placeholder container crash-loop from ACA default targetPort probe
+
+**Symptom:** System log for placeholder revision: `Container sdxl-api failed startup probe, will be restarted` → `startup probe failed: connection refused (Count 300)`. Placeholder crash-looped, keeping node 1 occupied and preventing the real revision from advancing.
+
+**Root cause (investigation findings):**
+
+The probe gating in the bicep (`probes: exists ? [...] : []`) compiled CORRECTLY to the ARM template — this was **not** the bug. The ARM expression correctly evaluates `probes: []` when `exists=false`.
+
+The crash-loop was caused by **ACA's platform-level default probe**: when ingress `targetPort` is set (8000), ACA applies a built-in startup check on that port regardless of the user-configured `probes` array. The prior placeholder (`mcr.microsoft.com/azuredocs/containerapps-helloworld:latest`) listens on port 80, not 8000 → ACA default check on 8000 → `connection refused` → crash-loop.
+
+**Fix (`aca.bicep`):**
+- Changed placeholder to `python:3.11-slim` with `command: ['python3', '-m', 'http.server', '8000']`. This is the same image used as the Dockerfile base (publicly available, no ACR auth needed). The command starts a minimal HTTP server on port 8000, satisfying ACA's built-in health check with no user-configured probes required.
+- Added **Startup probe** to the `exists=true` (real image) probe array. `failureThreshold: 30 × periodSeconds: 10 = 300s` startup window for SDXL's slow CPU-based model load.
+- Kept `probes: []` for `exists=false` (placeholder) as designed.
+- Restructured bicep into two explicit container vars (`placeholderContainer`, `realContainer`) selected by `containers: [exists ? realContainer : placeholderContainer]`. This makes the compiled ARM expression unambiguous and avoids any probe leaking between cases.
+
+**Verification (main.json compiled ARM expressions):**
+
+`exists=false` → `variables('placeholderContainer')`:
+- `image: 'python:3.11-slim'`
+- `command: ['python3', '-m', 'http.server', '8000']`
+- `probes: []` ✅
+
+`exists=true` → `createObject(... probes: createArray(Startup, Liveness, Readiness))`:
+- Startup: `/health:8000`, initialDelay 10s, period 10s, failureThreshold 30
+- Liveness: `/health:8000`, initialDelay 60s, period 30s
+- Readiness: `/health:8000`, initialDelay 30s, period 10s ✅
+
+Validation: both `apiExists=false` and `apiExists=true` → `provisioningState: Succeeded, error: null`.

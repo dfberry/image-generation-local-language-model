@@ -10,20 +10,94 @@ param storageAccountKey string = ''
 param workloadProfileName string = 'dedicated-d4'
 
 // On first provision the real image hasn't been pushed to ACR yet (azd builds
-// and pushes during `azd deploy`, which runs AFTER `azd provision`). Use a
-// public Microsoft placeholder so the container app provisions without
-// authentication or a missing-tag error. azd deploy then calls
-// `az containerapp update --image <real>` and the probes are live after that.
-//
-// On subsequent provisions (exists=true), read the image the running app is
-// already using so a re-provision never clobbers a deployed revision.
+// and pushes during `azd deploy`, which runs AFTER `azd provision`). Use
+// python:3.11-slim as placeholder with an explicit command that starts a
+// minimal HTTP server on port 8000. This satisfies ACA's default targetPort
+// health check (which fires even when probes:[] is set) and prevents the
+// crash-loop that deadlocks the rolling update. On subsequent provisions
+// (exists=true), read the image the running app is already using so a
+// re-provision never clobbers a deployed revision.
 resource existingApp 'Microsoft.App/containerApps@2023-05-01' existing = if (exists) {
   name: containerAppName
 }
 
-var containerImage = exists
-  ? (existingApp.properties.template.containers[0].image ?? 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest')
-  : 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
+var realImage = exists
+  ? (existingApp.properties.template.containers[0].image ?? 'python:3.11-slim')
+  : 'python:3.11-slim'
+
+// Placeholder container: python:3.11-slim + python3 -m http.server 8000.
+// No probes — the HTTP server satisfies ACA's default targetPort TCP check.
+var placeholderContainer = {
+  name: 'sdxl-api'
+  image: 'python:3.11-slim'
+  command: ['python3', '-m', 'http.server', '8000']
+  resources: {
+    cpu: json('4')
+    memory: '16Gi'
+  }
+  env: [
+    {
+      name: 'PORT'
+      value: '8000'
+    }
+  ]
+  probes: []
+}
+
+// Real app container: image read from the running app, no command override
+// (uses Dockerfile CMD: python3 app.py), full /health probes.
+var realContainer = {
+  name: 'sdxl-api'
+  image: realImage
+  resources: {
+    cpu: json('4')
+    memory: '16Gi'
+  }
+  env: [
+    {
+      name: 'PORT'
+      value: '8000'
+    }
+  ]
+  volumeMounts: !empty(storageAccountName) ? [
+    {
+      volumeName: 'models-cache'
+      mountPath: '/root/.cache/huggingface'
+    }
+  ] : []
+  probes: [
+    {
+      // Startup probe runs first; gives SDXL (CPU, slow start) time to load.
+      // failureThreshold * periodSeconds = 300s window before giving up.
+      type: 'Startup'
+      httpGet: {
+        path: '/health'
+        port: 8000
+      }
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      failureThreshold: 30
+    }
+    {
+      type: 'Liveness'
+      httpGet: {
+        path: '/health'
+        port: 8000
+      }
+      initialDelaySeconds: 60
+      periodSeconds: 30
+    }
+    {
+      type: 'Readiness'
+      httpGet: {
+        path: '/health'
+        port: 8000
+      }
+      initialDelaySeconds: 30
+      periodSeconds: 10
+    }
+  ]
+}
 
 resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
   name: containerAppName
@@ -64,50 +138,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
       ] : []
     }
     template: {
-      containers: [
-        {
-          name: 'sdxl-api'
-          image: containerImage
-          resources: {
-            cpu: json('4')
-            memory: '16Gi'
-          }
-          env: [
-            {
-              name: 'PORT'
-              value: '8000'
-            }
-          ]
-          volumeMounts: !empty(storageAccountName) ? [
-            {
-              volumeName: 'models-cache'
-              mountPath: '/root/.cache/huggingface'
-            }
-          ] : []
-          // Health probes only active once the real image is deployed.
-          // The placeholder image does not serve /health on port 8000.
-          probes: exists ? [
-            {
-              type: 'Liveness'
-              httpGet: {
-                path: '/health'
-                port: 8000
-              }
-              initialDelaySeconds: 60
-              periodSeconds: 30
-            }
-            {
-              type: 'Readiness'
-              httpGet: {
-                path: '/health'
-                port: 8000
-              }
-              initialDelaySeconds: 30
-              periodSeconds: 10
-            }
-          ] : []
-        }
-      ]
+      containers: [exists ? realContainer : placeholderContainer]
       volumes: !empty(storageAccountName) ? [
         {
           name: 'models-cache'

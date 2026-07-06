@@ -35,7 +35,11 @@ resource containerAppsEnvironment 'Microsoft.App/managedEnvironments@2023-05-01'
         name: 'dedicated-d4'
         workloadProfileType: 'D4'
         minimumCount: 1
-        maximumCount: 1
+        // maximumCount 2: rolling updates need two nodes briefly — old revision holds
+        // the single node while the new revision is being scheduled. With max=1 the new
+        // revision can never start (deadlock). Two nodes breaks that deadlock.
+        // Live hotfix already applied via az containerapp env workload-profile update.
+        maximumCount: 2
       }
     ]
   }

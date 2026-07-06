@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.42.1.51946",
-      "templateHash": "6136433561475147486"
+      "templateHash": "9517554614207604469"
     }
   },
   "parameters": {
@@ -217,7 +217,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.42.1.51946",
-              "templateHash": "5651120803635434294"
+              "templateHash": "7233958165951272694"
             }
           },
           "parameters": {
@@ -264,7 +264,7 @@
                     "name": "dedicated-d4",
                     "workloadProfileType": "D4",
                     "minimumCount": 1,
-                    "maximumCount": 1
+                    "maximumCount": 2
                   }
                 ]
               },
@@ -326,7 +326,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.42.1.51946",
-              "templateHash": "16743524966841517609"
+              "templateHash": "11550686779447025468"
             }
           },
           "parameters": {
@@ -361,6 +361,29 @@
             "workloadProfileName": {
               "type": "string",
               "defaultValue": "dedicated-d4"
+            }
+          },
+          "variables": {
+            "placeholderContainer": {
+              "name": "sdxl-api",
+              "image": "python:3.11-slim",
+              "command": [
+                "python3",
+                "-m",
+                "http.server",
+                "8000"
+              ],
+              "resources": {
+                "cpu": "[json('4')]",
+                "memory": "16Gi"
+              },
+              "env": [
+                {
+                  "name": "PORT",
+                  "value": "8000"
+                }
+              ],
+              "probes": []
             }
           },
           "resources": [
@@ -398,22 +421,7 @@
                 },
                 "template": {
                   "containers": [
-                    {
-                      "name": "sdxl-api",
-                      "image": "[if(parameters('exists'), coalesce(reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2023-05-01').template.containers[0].image, 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'), 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest')]",
-                      "resources": {
-                        "cpu": "[json('4')]",
-                        "memory": "16Gi"
-                      },
-                      "env": [
-                        {
-                          "name": "PORT",
-                          "value": "8000"
-                        }
-                      ],
-                      "volumeMounts": "[if(not(empty(parameters('storageAccountName'))), createArray(createObject('volumeName', 'models-cache', 'mountPath', '/root/.cache/huggingface')), createArray())]",
-                      "probes": "[if(parameters('exists'), createArray(createObject('type', 'Liveness', 'httpGet', createObject('path', '/health', 'port', 8000), 'initialDelaySeconds', 60, 'periodSeconds', 30), createObject('type', 'Readiness', 'httpGet', createObject('path', '/health', 'port', 8000), 'initialDelaySeconds', 30, 'periodSeconds', 10)), createArray())]"
-                    }
+                    "[if(parameters('exists'), createObject('name', 'sdxl-api', 'image', if(parameters('exists'), coalesce(reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2023-05-01').template.containers[0].image, 'python:3.11-slim'), 'python:3.11-slim'), 'resources', createObject('cpu', json('4'), 'memory', '16Gi'), 'env', createArray(createObject('name', 'PORT', 'value', '8000')), 'volumeMounts', if(not(empty(parameters('storageAccountName'))), createArray(createObject('volumeName', 'models-cache', 'mountPath', '/root/.cache/huggingface')), createArray()), 'probes', createArray(createObject('type', 'Startup', 'httpGet', createObject('path', '/health', 'port', 8000), 'initialDelaySeconds', 10, 'periodSeconds', 10, 'failureThreshold', 30), createObject('type', 'Liveness', 'httpGet', createObject('path', '/health', 'port', 8000), 'initialDelaySeconds', 60, 'periodSeconds', 30), createObject('type', 'Readiness', 'httpGet', createObject('path', '/health', 'port', 8000), 'initialDelaySeconds', 30, 'periodSeconds', 10))), variables('placeholderContainer'))]"
                   ],
                   "volumes": "[if(not(empty(parameters('storageAccountName'))), createArray(createObject('name', 'models-cache', 'storageType', 'AzureFile', 'storageName', 'models-storage')), createArray())]",
                   "scale": {
