@@ -44,7 +44,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def get_device(force_cpu: bool) -> str:
+def get_device(force_cpu: bool = False) -> str:
     """Detect best available device."""
     if force_cpu:
         return "cpu"
@@ -227,6 +227,48 @@ def generate(args) -> str:
             torch._dynamo.reset()
 
     return output_path
+
+
+def run_batch(
+    prompts: list[dict],
+    steps: int = 40,
+    guidance: float = 7.5,
+    width: int = 1024,
+    height: int = 1024,
+    refine: bool = False,
+    cpu: bool = False,
+) -> list[dict]:
+    """Generate a batch using the Flask API parameter shape."""
+    results = []
+    for item in prompts:
+        args = SimpleNamespace(
+            prompt=item["prompt"],
+            output=item.get("output"),
+            seed=item.get("seed"),
+            steps=steps,
+            guidance=guidance,
+            width=width,
+            height=height,
+            refine=refine,
+            cpu=cpu,
+        )
+        try:
+            output_path = generate_with_retry(args)
+            results.append({
+                "prompt": item["prompt"],
+                "output": output_path,
+                "status": "ok",
+                "error": None,
+            })
+        except Exception as exc:
+            results.append({
+                "prompt": item["prompt"],
+                "output": item.get("output"),
+                "status": "error",
+                "error": str(exc),
+            })
+
+    return results
 
 
 def batch_generate(prompts: list[dict], device: str = "mps") -> list[dict]:
