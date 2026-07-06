@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.42.1.51946",
-      "templateHash": "9517554614207604469"
+      "templateHash": "11802722807303637516"
     }
   },
   "parameters": {
@@ -326,7 +326,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.42.1.51946",
-              "templateHash": "11550686779447025468"
+              "templateHash": "10705064110587939032"
             }
           },
           "parameters": {
@@ -421,7 +421,7 @@
                 },
                 "template": {
                   "containers": [
-                    "[if(parameters('exists'), createObject('name', 'sdxl-api', 'image', if(parameters('exists'), coalesce(reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2023-05-01').template.containers[0].image, 'python:3.11-slim'), 'python:3.11-slim'), 'resources', createObject('cpu', json('4'), 'memory', '16Gi'), 'env', createArray(createObject('name', 'PORT', 'value', '8000')), 'volumeMounts', if(not(empty(parameters('storageAccountName'))), createArray(createObject('volumeName', 'models-cache', 'mountPath', '/root/.cache/huggingface')), createArray()), 'probes', createArray(createObject('type', 'Startup', 'httpGet', createObject('path', '/health', 'port', 8000), 'initialDelaySeconds', 10, 'periodSeconds', 10, 'failureThreshold', 30), createObject('type', 'Liveness', 'httpGet', createObject('path', '/health', 'port', 8000), 'initialDelaySeconds', 60, 'periodSeconds', 30), createObject('type', 'Readiness', 'httpGet', createObject('path', '/health', 'port', 8000), 'initialDelaySeconds', 30, 'periodSeconds', 10))), variables('placeholderContainer'))]"
+                    "[if(parameters('exists'), createObject('name', 'sdxl-api', 'image', if(parameters('exists'), coalesce(reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2023-05-01').template.containers[0].image, 'python:3.11-slim'), 'python:3.11-slim'), 'command', createArray(), 'resources', createObject('cpu', json('4'), 'memory', '16Gi'), 'env', createArray(createObject('name', 'PORT', 'value', '8000')), 'volumeMounts', if(not(empty(parameters('storageAccountName'))), createArray(createObject('volumeName', 'models-cache', 'mountPath', '/root/.cache/huggingface')), createArray()), 'probes', createArray(createObject('type', 'Startup', 'httpGet', createObject('path', '/health', 'port', 8000), 'initialDelaySeconds', 10, 'periodSeconds', 10, 'failureThreshold', 30), createObject('type', 'Liveness', 'httpGet', createObject('path', '/health', 'port', 8000), 'initialDelaySeconds', 60, 'periodSeconds', 30), createObject('type', 'Readiness', 'httpGet', createObject('path', '/health', 'port', 8000), 'initialDelaySeconds', 30, 'periodSeconds', 10))), variables('placeholderContainer'))]"
                   ],
                   "volumes": "[if(not(empty(parameters('storageAccountName'))), createArray(createObject('name', 'models-cache', 'storageType', 'AzureFile', 'storageName', 'models-storage')), createArray())]",
                   "scale": {
