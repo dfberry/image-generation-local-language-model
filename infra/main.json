@@ -4,8 +4,8 @@
   "metadata": {
     "_generator": {
       "name": "bicep",
-      "version": "0.41.2.15936",
-      "templateHash": "13892018995717492843"
+      "version": "0.42.1.51946",
+      "templateHash": "6136433561475147486"
     }
   },
   "parameters": {
@@ -25,20 +25,80 @@
       "type": "string",
       "defaultValue": "sdxl-env"
     },
-    "imageName": {
-      "type": "string",
-      "defaultValue": "sdxl-api:latest"
-    },
     "containerRegistryUrl": {
       "type": "string",
       "defaultValue": ""
+    },
+    "apiExists": {
+      "type": "bool",
+      "defaultValue": false
     }
   },
   "variables": {
-    "acrUrl": "[if(not(empty(parameters('containerRegistryUrl'))), parameters('containerRegistryUrl'), format('{0}.azurecr.io', parameters('containerRegistryName')))]",
-    "fullImageName": "[format('{0}/{1}', variables('acrUrl'), parameters('imageName'))]"
+    "acrUrl": "[if(not(empty(parameters('containerRegistryUrl'))), parameters('containerRegistryUrl'), format('{0}.azurecr.io', parameters('containerRegistryName')))]"
   },
   "resources": [
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "identity-deployment",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "identityName": {
+            "value": "[format('{0}-id', parameters('containerAppName'))]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.42.1.51946",
+              "templateHash": "12439813774949116044"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "defaultValue": "[resourceGroup().location]"
+            },
+            "identityName": {
+              "type": "string"
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+              "apiVersion": "2023-01-31",
+              "name": "[parameters('identityName')]",
+              "location": "[parameters('location')]"
+            }
+          ],
+          "outputs": {
+            "identityId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('identityName'))]"
+            },
+            "principalId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('identityName')), '2023-01-31').principalId]"
+            },
+            "clientId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('identityName')), '2023-01-31').clientId]"
+            }
+          }
+        }
+      }
+    },
     {
       "type": "Microsoft.Resources/deployments",
       "apiVersion": "2025-04-01",
@@ -54,6 +114,9 @@
           },
           "containerRegistryName": {
             "value": "[parameters('containerRegistryName')]"
+          },
+          "uamiPrincipalId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'identity-deployment'), '2025-04-01').outputs.principalId.value]"
           }
         },
         "template": {
@@ -62,8 +125,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.41.2.15936",
-              "templateHash": "6717042160696540461"
+              "version": "0.42.1.51946",
+              "templateHash": "14225105687026033462"
             }
           },
           "parameters": {
@@ -73,7 +136,13 @@
             },
             "containerRegistryName": {
               "type": "string"
+            },
+            "uamiPrincipalId": {
+              "type": "string"
             }
+          },
+          "variables": {
+            "acrPullRoleDefinitionId": "7f951dda-4ed3-4680-a7ca-43fe172d538d"
           },
           "resources": [
             {
@@ -85,9 +154,23 @@
                 "name": "Basic"
               },
               "properties": {
-                "adminUserEnabled": true,
+                "adminUserEnabled": false,
                 "publicNetworkAccess": "Enabled"
               }
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName'))]",
+              "name": "[guid(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), parameters('uamiPrincipalId'), variables('acrPullRoleDefinitionId'))]",
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('acrPullRoleDefinitionId'))]",
+                "principalId": "[parameters('uamiPrincipalId')]",
+                "principalType": "ServicePrincipal"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName'))]"
+              ]
             }
           ],
           "outputs": {
@@ -105,7 +188,10 @@
             }
           }
         }
-      }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'identity-deployment')]"
+      ]
     },
     {
       "type": "Microsoft.Resources/deployments",
@@ -130,8 +216,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.41.2.15936",
-              "templateHash": "11573025209438501766"
+              "version": "0.42.1.51946",
+              "templateHash": "5651120803635434294"
             }
           },
           "parameters": {
@@ -145,6 +231,18 @@
           },
           "resources": [
             {
+              "type": "Microsoft.OperationalInsights/workspaces",
+              "apiVersion": "2021-12-01-preview",
+              "name": "[format('{0}-logs', parameters('environmentName'))]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "sku": {
+                  "name": "PerGB2018"
+                },
+                "retentionInDays": 30
+              }
+            },
+            {
               "type": "Microsoft.App/managedEnvironments",
               "apiVersion": "2023-05-01",
               "name": "[parameters('environmentName')]",
@@ -153,11 +251,26 @@
                 "appLogsConfiguration": {
                   "destination": "log-analytics",
                   "logAnalyticsConfiguration": {
-                    "customerId": "",
-                    "sharedKey": ""
+                    "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', format('{0}-logs', parameters('environmentName'))), '2021-12-01-preview').customerId]",
+                    "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', format('{0}-logs', parameters('environmentName'))), '2021-12-01-preview').primarySharedKey]"
                   }
-                }
-              }
+                },
+                "workloadProfiles": [
+                  {
+                    "name": "Consumption",
+                    "workloadProfileType": "Consumption"
+                  },
+                  {
+                    "name": "dedicated-d4",
+                    "workloadProfileType": "D4",
+                    "minimumCount": 1,
+                    "maximumCount": 1
+                  }
+                ]
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.OperationalInsights/workspaces', format('{0}-logs', parameters('environmentName')))]"
+              ]
             }
           ],
           "outputs": {
@@ -168,6 +281,10 @@
             "environmentName": {
               "type": "string",
               "value": "[parameters('environmentName')]"
+            },
+            "logAnalyticsWorkspaceId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.OperationalInsights/workspaces', format('{0}-logs', parameters('environmentName')))]"
             }
           }
         }
@@ -192,14 +309,14 @@
           "containerAppsEnvironmentId": {
             "value": "[reference(resourceId('Microsoft.Resources/deployments', 'aca-env-deployment'), '2025-04-01').outputs.environmentId.value]"
           },
-          "imageName": {
-            "value": "[variables('fullImageName')]"
-          },
           "containerRegistryUrl": {
             "value": "[variables('acrUrl')]"
           },
-          "containerRegistryUsername": {
-            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'acr-deployment'), '2025-04-01').outputs.loginServer.value]"
+          "uamiId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'identity-deployment'), '2025-04-01').outputs.identityId.value]"
+          },
+          "exists": {
+            "value": "[parameters('apiExists')]"
           }
         },
         "template": {
@@ -208,8 +325,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.41.2.15936",
-              "templateHash": "8357662444333127872"
+              "version": "0.42.1.51946",
+              "templateHash": "16743524966841517609"
             }
           },
           "parameters": {
@@ -223,18 +340,27 @@
             "containerAppsEnvironmentId": {
               "type": "string"
             },
-            "imageName": {
-              "type": "string"
-            },
             "containerRegistryUrl": {
               "type": "string"
             },
-            "containerRegistryUsername": {
+            "uamiId": {
               "type": "string"
             },
-            "containerRegistryPassword": {
+            "exists": {
+              "type": "bool",
+              "defaultValue": false
+            },
+            "storageAccountName": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "storageAccountKey": {
               "type": "securestring",
               "defaultValue": ""
+            },
+            "workloadProfileName": {
+              "type": "string",
+              "defaultValue": "dedicated-d4"
             }
           },
           "resources": [
@@ -243,8 +369,18 @@
               "apiVersion": "2023-05-01",
               "name": "[parameters('containerAppName')]",
               "location": "[parameters('location')]",
+              "tags": {
+                "azd-service-name": "api"
+              },
+              "identity": {
+                "type": "UserAssigned",
+                "userAssignedIdentities": {
+                  "[format('{0}', parameters('uamiId'))]": {}
+                }
+              },
               "properties": {
                 "environmentId": "[parameters('containerAppsEnvironmentId')]",
+                "workloadProfileName": "[parameters('workloadProfileName')]",
                 "configuration": {
                   "ingress": {
                     "external": true,
@@ -252,18 +388,22 @@
                     "transport": "auto",
                     "allowInsecure": false
                   },
-                  "registries": "[if(not(empty(parameters('containerRegistryPassword'))), createArray(createObject('server', parameters('containerRegistryUrl'), 'username', parameters('containerRegistryUsername'), 'passwordSecretRef', 'registry-password')), createArray())]",
-                  "secrets": "[if(not(empty(parameters('containerRegistryPassword'))), createArray(createObject('name', 'registry-password', 'value', parameters('containerRegistryPassword'))), createArray())]"
+                  "registries": [
+                    {
+                      "server": "[parameters('containerRegistryUrl')]",
+                      "identity": "[parameters('uamiId')]"
+                    }
+                  ],
+                  "secrets": "[if(not(empty(parameters('storageAccountKey'))), createArray(createObject('name', 'storage-account-key', 'value', parameters('storageAccountKey'))), createArray())]"
                 },
                 "template": {
                   "containers": [
                     {
                       "name": "sdxl-api",
-                      "image": "[parameters('imageName')]",
+                      "image": "[if(parameters('exists'), coalesce(reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2023-05-01').template.containers[0].image, 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'), 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest')]",
                       "resources": {
                         "cpu": "[json('4')]",
-                        "memory": "16Gi",
-                        "ephemeralStorage": "1Gi"
+                        "memory": "16Gi"
                       },
                       "env": [
                         {
@@ -271,30 +411,13 @@
                           "value": "8000"
                         }
                       ],
-                      "probes": [
-                        {
-                          "type": "Liveness",
-                          "httpGet": {
-                            "path": "/health",
-                            "port": 8000
-                          },
-                          "initialDelaySeconds": 60,
-                          "periodSeconds": 30
-                        },
-                        {
-                          "type": "Readiness",
-                          "httpGet": {
-                            "path": "/health",
-                            "port": 8000
-                          },
-                          "initialDelaySeconds": 30,
-                          "periodSeconds": 10
-                        }
-                      ]
+                      "volumeMounts": "[if(not(empty(parameters('storageAccountName'))), createArray(createObject('volumeName', 'models-cache', 'mountPath', '/root/.cache/huggingface')), createArray())]",
+                      "probes": "[if(parameters('exists'), createArray(createObject('type', 'Liveness', 'httpGet', createObject('path', '/health', 'port', 8000), 'initialDelaySeconds', 60, 'periodSeconds', 30), createObject('type', 'Readiness', 'httpGet', createObject('path', '/health', 'port', 8000), 'initialDelaySeconds', 30, 'periodSeconds', 10)), createArray())]"
                     }
                   ],
+                  "volumes": "[if(not(empty(parameters('storageAccountName'))), createArray(createObject('name', 'models-cache', 'storageType', 'AzureFile', 'storageName', 'models-storage')), createArray())]",
                   "scale": {
-                    "minReplicas": 0,
+                    "minReplicas": 1,
                     "maxReplicas": 1
                   }
                 }
@@ -318,19 +441,19 @@
         }
       },
       "dependsOn": [
-        "[resourceId('Microsoft.Resources/deployments', 'acr-deployment')]",
-        "[resourceId('Microsoft.Resources/deployments', 'aca-env-deployment')]"
+        "[resourceId('Microsoft.Resources/deployments', 'aca-env-deployment')]",
+        "[resourceId('Microsoft.Resources/deployments', 'identity-deployment')]"
       ]
     }
   ],
   "outputs": {
+    "AZURE_CONTAINER_REGISTRY_ENDPOINT": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'acr-deployment'), '2025-04-01').outputs.loginServer.value]"
+    },
     "containerAppUrl": {
       "type": "string",
       "value": "[reference(resourceId('Microsoft.Resources/deployments', 'container-app-deployment'), '2025-04-01').outputs.fqdn.value]"
-    },
-    "containerRegistryUrl": {
-      "type": "string",
-      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'acr-deployment'), '2025-04-01').outputs.loginServer.value]"
     },
     "containerAppName": {
       "type": "string",
