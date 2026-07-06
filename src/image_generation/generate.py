@@ -74,9 +74,19 @@ def load_base(device: str) -> DiffusionPipeline:
         # fp16 variant available for CUDA and MPS
         variant="fp16" if device in ("cuda", "mps") else None,
     )
-    if device in ("cpu", "mps"):
-        # CPU offload reduces VRAM pressure; MPS benefits too
+    if device == "mps":
+        # MPS benefits from model CPU offload
         pipe.enable_model_cpu_offload()
+    elif device == "cpu":
+        # Pure CPU: offload requires an accelerator, so keep the pipeline
+        # resident and cut peak RAM with attention/VAE slicing + tiling.
+        pipe.to("cpu")
+        pipe.enable_attention_slicing()
+        try:
+            pipe.enable_vae_slicing()
+            pipe.enable_vae_tiling()
+        except Exception:
+            pass
     else:
         pipe.to(device)
 
@@ -101,8 +111,16 @@ def load_refiner(text_encoder_2, vae, device: str) -> DiffusionPipeline:
         use_safetensors=True,
         variant="fp16" if device in ("cuda", "mps") else None,
     )
-    if device in ("cpu", "mps"):
+    if device == "mps":
         refiner.enable_model_cpu_offload()
+    elif device == "cpu":
+        refiner.to("cpu")
+        refiner.enable_attention_slicing()
+        try:
+            refiner.enable_vae_slicing()
+            refiner.enable_vae_tiling()
+        except Exception:
+            pass
     else:
         refiner.to(device)
     return refiner
