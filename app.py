@@ -7,7 +7,9 @@ Endpoints:
   GET  /ui           - Browser UI (alias of /)
   GET  /api          - API info (JSON)
   GET  /health       - Health check (no model load)
-  POST /generate     - Generate images from a batch config (loads model on first call)
+  POST /generate     - Generate images from a batch config (synchronous; loads model on first call)
+  POST /generate/async - Start background generation; returns 202 immediately
+  GET  /generate/status - Poll generation state: idle | in_progress | ready | error
   POST /model/pull   - Kick off async model download/warm-up; returns 202 immediately
   GET  /model/status - Poll warm-up state: not_started | in_progress | ready | error
 
@@ -123,6 +125,117 @@ def _pull_worker() -> None:
                 "message": "Model pull failed. See 'error' field.",
                 "finished_at": finished.isoformat(),
                 "elapsed_seconds": elapsed,
+                "error": msg,
+            })
+
+
+# ---------------------------------------------------------------------------
+# Async generation state (browser flow)
+#
+# Synchronous /generate blocks until every image is rendered. On CPU that can
+# take many minutes, which exceeds the Azure Container Apps HTTP ingress
+# request timeout (~240s) — the connection is killed before the response
+# starts, so the browser never receives the image. The endpoints below run
+# generation in a background thread (like /model/pull) so the browser can poll
+# for the result instead of holding one long request open.
+# ---------------------------------------------------------------------------
+_gen_state_lock = threading.Lock()
+_gen_state: dict = {
+    "state": "idle",          # idle | in_progress | ready | error
+    "message": "No generation has been requested yet.",
+    "results": [],
+    "device": None,
+    "started_at": None,
+    "finished_at": None,
+    "elapsed_seconds": None,
+    "error": None,
+}
+
+
+def _run_generation(config: dict) -> None:
+    """Background thread: run a batch and stash base64 results in _gen_state."""
+    started = datetime.now(timezone.utc)
+    try:
+        settings = config["settings"] if isinstance(config.get("settings"), dict) else {}
+
+        def _resolve(key, default):
+            if key in config:
+                return config[key]
+            if key in settings:
+                return settings[key]
+            return default
+
+        prompts = config.get("prompts", [])
+        steps = int(_resolve("steps", 40))
+        guidance = float(_resolve("guidance", 7.5))
+        width = int(_resolve("width", 1024))
+        height = int(_resolve("height", 1024))
+        refine = _resolve("refine", False)
+        use_cpu = _resolve("cpu", False)
+        device = "cpu" if use_cpu else get_device(use_cpu)
+        logger.info(f"generate(async): {len(prompts)} image(s) on device: {device}")
+
+        batch_items = []
+        for p_obj in prompts:
+            batch_items.append({
+                "prompt": p_obj["prompt"],
+                "output": p_obj.get("output"),
+                "seed": p_obj.get("seed"),
+                "negative_prompt": p_obj.get("negative_prompt"),
+            })
+
+        results = run_batch(
+            batch_items,
+            steps=steps,
+            guidance=guidance,
+            width=width,
+            height=height,
+            refine=refine,
+            cpu=use_cpu,
+        )
+
+        # Enrich ok results with base64 image bytes (ephemeral cloud filesystem).
+        for r in results:
+            if r["status"] == "ok" and r.get("output") and os.path.isfile(r["output"]):
+                try:
+                    with open(r["output"], "rb") as f:
+                        r["image_base64"] = base64.b64encode(f.read()).decode("utf-8")
+                    r["filename"] = os.path.basename(r["output"])
+                    r["content_type"] = "image/png"
+                except Exception as read_err:
+                    r["image_base64"] = None
+                    existing_error = r.get("error") or ""
+                    r["error"] = f"{existing_error}; read error: {read_err}".lstrip("; ")
+                logger.info(f"✅ Generated: {r.get('output')}")
+            else:
+                r["image_base64"] = None
+                if r["status"] != "ok":
+                    logger.error(f"❌ {r['status']}: {r.get('error')}")
+
+        finished = datetime.now(timezone.utc)
+        ok_count = sum(1 for r in results if r["status"] == "ok")
+        with _gen_state_lock:
+            _gen_state.update({
+                "state": "ready",
+                "message": f"Generated {ok_count}/{len(results)} image(s).",
+                "results": results,
+                "device": device,
+                "finished_at": finished.isoformat(),
+                "elapsed_seconds": (finished - started).total_seconds(),
+                "error": None,
+            })
+
+    except (OOMError, Exception) as exc:
+        finished = datetime.now(timezone.utc)
+        msg = str(exc)
+        logger.error(f"generate(async): failed — {msg}", exc_info=True)
+        with _gen_state_lock:
+            _gen_state.update({
+                "state": "error",
+                "message": "Generation failed. See 'error' field.",
+                "results": [],
+                "finished_at": finished.isoformat(),
+                "elapsed_seconds": (finished - started).total_seconds(),
                 "error": msg,
             })
 
@@ -445,6 +558,90 @@ def model_status():
 
     return jsonify(snapshot), 200
 
+
+@app.route("/generate/async", methods=["POST"])
+def generate_async():
+    """
+    POST /generate/async
+
+    Same request body as POST /generate, but runs generation in a background
+    thread and returns 202 immediately. Poll GET /generate/status for the
+    result. Use this from browsers / over Azure Container Apps ingress, where
+    a long synchronous /generate would exceed the request timeout.
+
+    Response (202): { "state": "in_progress", "message": "...", "timestamp": "..." }
+    """
+    config = request.get_json(silent=True)
+    if config is None:
+        return jsonify({
+            "state": "error",
+            "error": "Request body must be valid JSON",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 400
+
+    validation_error = validate_batch_config(config)
+    if validation_error:
+        return jsonify({
+            "state": "error",
+            "error": validation_error,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 400
+
+    with _gen_state_lock:
+        if _gen_state["state"] == "in_progress":
+            return jsonify({
+                "state": "in_progress",
+                "message": "A generation is already in progress. Poll GET /generate/status.",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }), 202
+
+        _gen_state.update({
+            "state": "in_progress",
+            "message": "Generation started.",
+            "results": [],
+            "device": None,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "elapsed_seconds": None,
+            "error": None,
+        })
+
+    threading.Thread(
+        target=_run_generation, args=(config,), daemon=True, name="generate"
+    ).start()
+    logger.info("generate/async: background thread launched")
+
+    return jsonify({
+        "state": "in_progress",
+        "message": "Generation started in background. Poll GET /generate/status.",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }), 202
+
+
+@app.route("/generate/status", methods=["GET"])
+def generate_status():
+    """
+    GET /generate/status
+
+    Returns the current async-generation state. When state is "ready", the
+    "results" array carries the same per-image objects as POST /generate,
+    including "image_base64" for download.
+
+    Response (always HTTP 200):
+        { "state": "idle"|"in_progress"|"ready"|"error",
+          "message": "...", "results": [...], "device": "...",
+          "started_at": "...", "finished_at": "...",
+          "elapsed_seconds": <number|null>, "error": "<string|null>",
+          "timestamp": "..." }
+    """
+    with _gen_state_lock:
+        snapshot = dict(_gen_state)
+
+    snapshot["timestamp"] = datetime.now(timezone.utc).isoformat()
+    if snapshot["state"] != "error":
+        snapshot.pop("error", None)
+
+    return jsonify(snapshot), 200
 
 @app.route("/", methods=["GET"])
 @app.route("/ui", methods=["GET"])
@@ -814,21 +1011,34 @@ def browser_ui():
         '    try{body=JSON.parse(raw);}catch(ex){const e=document.getElementById("gen-err");e.textContent="Invalid JSON: "+ex.message;e.classList.remove("hidden");btn.disabled=false;hide("gen-spin");return;}\n'
         '  }\n'
         '  try{\n'
-        '    const r=await fetch(B+"/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});\n'
+        '    const r=await fetch(B+"/generate/async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});\n'
         '    const d=await r.json();\n'
-        '    setJson("gen-pre",d);\n'
-        '    const lbl=document.getElementById("gen-resp-label");\n'
-        '    lbl.textContent="JSON response (HTTP "+r.status+(d.device?" \u00b7 "+d.device:"")+")";  \n'
-        '    show("gen-resp");\n'
-        '    if(d.status!=="success"){\n'
+        '    if(r.status>=400||d.state==="error"){\n'
         '      const e=document.getElementById("gen-err");e.textContent="Server error: "+(d.error||JSON.stringify(d));e.classList.remove("hidden");\n'
-        '    }else{\n'
-        '      _lastImgs=d.results||[];\n'
-        '      renderImages(_lastImgs);\n'
-        '      if(_lastImgs.some(x=>x.image_base64))show("btn-dl-all");\n'
+        '      btn.disabled=false;hide("gen-spin");return;\n'
         '    }\n'
-        '  }catch(e){const el=document.getElementById("gen-err");el.textContent="Request failed: "+e;el.classList.remove("hidden");}\n'
-        '  finally{btn.disabled=false;hide("gen-spin");}\n'
+        '    pollGenerate();\n'
+        '  }catch(e){const el=document.getElementById("gen-err");el.textContent="Request failed: "+e;el.classList.remove("hidden");btn.disabled=false;hide("gen-spin");}\n'
+        '}\n'
+        'async function pollGenerate(){\n'
+        '  try{\n'
+        '    const r=await fetch(B+"/generate/status");\n'
+        '    const d=await r.json();\n'
+        '    if(d.state==="in_progress"){setTimeout(pollGenerate,3000);return;}\n'
+        '    const btn=document.getElementById("btn-gen");btn.disabled=false;hide("gen-spin");\n'
+        '    const disp=Object.assign({},d);\n'
+        '    if(Array.isArray(d.results)){disp.results=d.results.map(x=>{const c=Object.assign({},x);if(c.image_base64)c.image_base64="["+c.image_base64.length+" b64 chars]";return c;});}\n'
+        '    setJson("gen-pre",disp);\n'
+        '    const lbl=document.getElementById("gen-resp-label");\n'
+        '    lbl.textContent="JSON response ("+d.state+(d.device?" \u00b7 "+d.device:"")+(d.elapsed_seconds?" \u00b7 "+Math.round(d.elapsed_seconds)+"s":"")+")";\n'
+        '    show("gen-resp");\n'
+        '    if(d.state==="error"){\n'
+        '      const e=document.getElementById("gen-err");e.textContent="Server error: "+(d.error||JSON.stringify(d));e.classList.remove("hidden");return;\n'
+        '    }\n'
+        '    _lastImgs=d.results||[];\n'
+        '    renderImages(_lastImgs);\n'
+        '    if(_lastImgs.some(x=>x.image_base64))show("btn-dl-all");\n'
+        '  }catch(e){const btn=document.getElementById("btn-gen");btn.disabled=false;hide("gen-spin");const el=document.getElementById("gen-err");el.textContent="Status poll failed: "+e;el.classList.remove("hidden");}\n'
         '}\n'
         'function renderImages(results){\n'
         '  const c=document.getElementById("gen-imgs");c.innerHTML="";\n'
@@ -890,7 +1100,9 @@ def root():
             "GET /ui": "Browser UI (alias of /)",
             "GET /api": "This message (JSON API index)",
             "GET /health": "Health check",
-            "POST /generate": "Generate images from batch config",
+            "POST /generate": "Generate images synchronously (returns images inline; may exceed cloud ingress timeouts on CPU)",
+            "POST /generate/async": "Start background generation (returns 202); poll GET /generate/status",
+            "GET /generate/status": "Poll async generation state: idle | in_progress | ready | error",
             "POST /model/pull": "Start async model download/warm-up (returns 202)",
             "GET /model/status": "Poll model warm-up state"
         },
