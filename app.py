@@ -3,15 +3,16 @@
 Flask wrapper for SDXL image generation.
 
 Endpoints:
-  GET  /             - API info (JSON)
+  GET  /             - Browser UI (HTML, self-contained)
+  GET  /ui           - Browser UI (alias of /)
+  GET  /api          - API info (JSON)
   GET  /health       - Health check (no model load)
-  GET  /ui           - Browser UI (HTML, self-contained)
   POST /generate     - Generate images from a batch config (loads model on first call)
   POST /model/pull   - Kick off async model download/warm-up; returns 202 immediately
   GET  /model/status - Poll warm-up state: not_started | in_progress | ready | error
 
 CORS: permissive (Access-Control-Allow-Origin: *) on all routes so the API
-can be called from any browser origin or from the /ui page itself.
+can be called from any browser origin or from the / (UI) page itself.
 """
 
 import base64
@@ -445,9 +446,13 @@ def model_status():
     return jsonify(snapshot), 200
 
 
+@app.route("/", methods=["GET"])
 @app.route("/ui", methods=["GET"])
 def browser_ui():
-    """Serve a self-contained browser console — one section per endpoint."""
+    """Serve a self-contained browser console — one section per endpoint.
+
+    Available at both `/` (root) and `/ui`. The JSON API index lives at `/api`.
+    """
     html = (
         '<!DOCTYPE html>\n'
         '<html lang="en">\n'
@@ -522,10 +527,10 @@ def browser_ui():
         '<h1>SDXL API Console</h1>\n'
         '<p class="subtitle">One section per endpoint. Every call shows the raw JSON response.</p>\n'
         '\n'
-        '<!-- 1. GET / -->\n'
+        '<!-- 1. GET /api -->\n'
         '<div class="card">\n'
         '  <div class="card-header">\n'
-        '    <span class="method get">GET</span><span class="path">/</span>\n'
+        '    <span class="method get">GET</span><span class="path">/api</span>\n'
         '    <span class="desc">API info &amp; endpoint listing</span>\n'
         '  </div>\n'
         '  <div class="controls">\n'
@@ -682,11 +687,11 @@ def browser_ui():
         '  document.getElementById(id).textContent=JSON.stringify(clone,null,2);\n'
         '}\n'
         '\n'
-        '// ── 1. GET / ────────────────────────────────────────────────────────\n'
+        '// ── 1. GET /api ──────────────────────────────────────────────────\n'
         'async function callRoot(){\n'
         '  show("root-spin");hide("root-resp");\n'
         '  try{\n'
-        '    const r=await fetch(B+"/");const d=await r.json();\n'
+        '    const r=await fetch(B+"/api");const d=await r.json();\n'
         '    setJson("root-pre",d);show("root-resp");\n'
         '  }catch(e){alert("Error: "+e);}\n'
         '  finally{hide("root-spin");}\n'
@@ -874,16 +879,17 @@ def browser_ui():
     return resp
 
 
-@app.route("/", methods=["GET"])
+@app.route("/api", methods=["GET"])
 def root():
-    """API root endpoint with basic info."""
+    """JSON API index with basic info. The browser UI is served at `/` and `/ui`."""
     return jsonify({
         "name": "SDXL Image Generation API",
         "version": "1.0.0",
         "endpoints": {
-            "GET /": "This message",
+            "GET /": "Browser UI — open in your browser to manage and generate images",
+            "GET /ui": "Browser UI (alias of /)",
+            "GET /api": "This message (JSON API index)",
             "GET /health": "Health check",
-            "GET /ui": "Browser UI — open in your browser to manage and generate images",
             "POST /generate": "Generate images from batch config",
             "POST /model/pull": "Start async model download/warm-up (returns 202)",
             "GET /model/status": "Poll model warm-up state"
