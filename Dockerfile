@@ -9,8 +9,9 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # Install system dependencies for image processing and OpenMP (torch)
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
