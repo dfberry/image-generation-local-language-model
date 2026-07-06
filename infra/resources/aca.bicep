@@ -44,12 +44,13 @@ var placeholderContainer = {
   probes: []
 }
 
-// Real app container: image read from the running app, explicitly clears the
-// placeholder command override so Dockerfile CMD runs, full /health probes.
+// Real app container: image read from the running app, explicitly sets the
+// Flask command. Do not rely on an empty command array clearing the first-run
+// placeholder override; azd deploy updates the image but preserves command.
 var realContainer = {
   name: 'sdxl-api'
   image: realImage
-  command: []
+  command: ['python3', 'app.py']
   resources: {
     cpu: json('4')
     memory: '16Gi'

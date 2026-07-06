@@ -119,6 +119,7 @@ cd <repo-root>
 azd env new <your-env-name>       # e.g. diberry-image4
 azd env set AZURE_LOCATION eastus2
 azd up
+azd provision
 ```
 
 What happens:
@@ -128,15 +129,18 @@ What happens:
    - ACR (with AcrPull role for UAMI)
    - Log Analytics + ACA Environment (Dedicated D4 workload profile)
    - Container App (`apiExists=false` → placeholder image, no probes)
-3. `azd deploy` — pushes real image to ACR, calls `az containerapp update --image <acr>/<tag>`, probes go live
+3. `azd deploy` — pushes real image to ACR, calls `az containerapp update --image <acr>/<tag>`
+4. `azd provision` — re-runs bicep with `apiExists=true`, reads the real running image, and explicitly sets `command: ['python3', 'app.py']` so Flask serves the app.
 
-**Re-deploy (code changes):**
+Why the second `azd provision` is required on a brand-new environment: azd's first pass provisions before the ACR image exists, so bicep must create a placeholder container that listens on port 8000. The subsequent azd deploy updates only the image and preserves the placeholder command. A second provision is the bicep-only step that applies the real-container command. `azd deploy` alone after the first `azd up` is not sufficient because it preserves the existing command.
+
+**Re-deploy (code changes after the first successful environment setup):**
 
 ```bash
 azd deploy     # or azd up (re-runs provision then deploy)
 ```
 
-On re-provision: `apiExists=true` → bicep reads current image from running app, no disruption.
+On re-provision: `apiExists=true` → bicep reads current image from running app and keeps `command: ['python3', 'app.py']`, so the placeholder command cannot return.
 
 **Teardown:**
 
@@ -217,8 +221,26 @@ Validation: both `apiExists=false` and `apiExists=true` → `provisioningState: 
 
 **Symptom:** The real ACR image was deployed, but `/health` and `/ui` returned `http.server` 404 responses. The container was running `python3 -m http.server 8000` instead of the app entrypoint.
 
-**Root cause:** The placeholder command override (`python3 -m http.server 8000`) was still present when `apiExists=true`. That override replaced the Dockerfile `CMD ["python3", "app.py"]`, so the SDXL API process never started.
+**Recurrence observed (2026-07-06):** Live app `sdxl-generation-api` in `rg-diberry-image4` served a Python `http.server` directory listing at `/`. The serving revision used the real ACR image (`sdxlregistry4itktska4kzhq.azurecr.io/...:azd-deploy-1783351839`) but still had `command: ['python3', '-m', 'http.server', '8000']`.
 
-**Live hotfix applied (2026-07-06):** `az containerapp update --command python3 app.py`
+**Definitive root cause:** On a fresh environment, azd runs `package -> provision -> deploy`. The first provision has `apiExists=false`, so bicep must create the app with the placeholder image and placeholder command. The deploy step then updates only the container image to the real ACR image and preserves the command. The `apiExists=true` bicep branch is not applied during that first `azd up`, so the placeholder command is stranded on the real image.
 
-**Durable fix (`aca.bicep`):** Keep the placeholder command only for `apiExists=false`. For `apiExists=true`, explicitly emit an empty command array (`command: []`) so Container Apps clears the placeholder override and runs the Dockerfile CMD. The `python:3.11-slim` placeholder image branch remains unchanged, and the 300s startup probe remains gated to the real container branch only.
+The secondary theory that `command: []` may not clear a previous command is not needed to explain this recurrence. However, the durable fix avoids that ambiguity entirely by never relying on empty-array clearing.
+
+**Live hotfix applied (2026-07-06):**
+
+```bash
+az containerapp update \
+  --name sdxl-generation-api \
+  --resource-group rg-diberry-image4 \
+  --command python3 app.py
+```
+
+Verification after the hotfix: `/health` returned HTTP 200 with `{"status":"healthy",...}`, and `/` returned the Flask API JSON instead of a directory listing.
+
+**Durable fix (`aca.bicep`):** Keep the placeholder command only for `apiExists=false`. For `apiExists=true`, explicitly set `command: ['python3', 'app.py']`. This is more robust than `command: []` because it does not depend on ARM/Container Apps clearing semantics and it makes every real-container revision carry the Flask command explicitly.
+
+**Options evaluated:**
+- Placeholder image with no command override: rejected. Common small public images that serve by default listen on port 80 or 8080, while this app's ingress and Flask process use port 8000. Changing ingress for the placeholder would break the real app after azd deploy.
+- Explicit real command in bicep: chosen. It reliably fixes all `apiExists=true` provisions and minimizes manual steps.
+- Postdeploy command reset: avoided. A hook could make a single fresh `azd up` self-heal, but hooks were previously removed as flaky on Windows. The bicep-only reliable sequence is `azd up` followed by `azd provision` for fresh environments.
