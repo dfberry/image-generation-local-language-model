@@ -25,6 +25,15 @@ Environment variables:
 
 import os
 import sys
+
+# Azure Files (SMB) lacks POSIX flock(); huggingface_hub's default FileLock
+# then raises "PermissionError: [Errno 13] Permission denied" when the HF cache
+# is on an SMB share. SoftFileLock (create-a-file lock) works on SMB. Patch
+# before importing huggingface_hub. No-op behaviour change on local disks.
+import filelock as _filelock
+if hasattr(_filelock, "SoftFileLock"):
+    _filelock.FileLock = _filelock.SoftFileLock
+
 from huggingface_hub import snapshot_download
 
 BASE_MODEL = os.environ.get(
