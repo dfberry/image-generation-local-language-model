@@ -7,8 +7,9 @@ services:
     project: .
     language: python
     host: containerapp
-    dockerfile: Dockerfile.cpu
-    port: 8000
+    docker:
+      path: Dockerfile.cpu
+      context: .
 
 metadata:
   version: 1.0.0
