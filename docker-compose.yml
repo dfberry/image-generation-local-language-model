@@ -1,0 +1,44 @@
+# Local end-to-end stack for the SDXL image-generation API.
+#
+#   docker compose up --build          # build image + start server
+#   open http://localhost:8000/        # browser UI (root route)
+#   POST /model/pull                   # downloads ~7GB SDXL weights (once)
+#   POST /generate                     # CPU generation (slow: ~5-6 min/image)
+#
+# The `hf-cache` named volume persists the ~7GB model download across
+# `docker compose down`/`up`, so you only pay the download once. Generated
+# images are written to the host `./outputs` folder.
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sdxl-image-generation-api:local
+    container_name: sdxl-api-local
+    ports:
+      - "8000:8000"
+    environment:
+      # from_pretrained() reads HF_HOME; point it at the mounted volume so the
+      # ~7GB download survives container restarts.
+      - HF_HOME=/root/.cache/huggingface
+      - PORT=8000
+      # CPU inference: use all detected cores for torch math.
+      - OMP_NUM_THREADS=16
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+      - ./outputs:/app/outputs
+    shm_size: "2gb"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+
+volumes:
+  hf-cache:
