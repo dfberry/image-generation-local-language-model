@@ -7,19 +7,23 @@ param containerRegistryPassword string = ''
 param storageAccountName string = ''
 param storageAccountKey string = ''
 param fileShareName string = 'huggingface-models'
+// Dedicated D4 workload profile (4 vCPU / 16 Gi) defined in aca-env.bicep.
+// Consumption profile caps at 2 vCPU / 4 Gi and cannot host 4 vCPU / 16 Gi containers.
+param workloadProfileName string = 'dedicated-d4'
 
 resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
   name: containerAppName
   location: location
   properties: {
     environmentId: containerAppsEnvironmentId
+    workloadProfileName: workloadProfileName
     configuration: {
       ingress: {
         external: true
         targetPort: 8000
         transport: 'auto'
         allowInsecure: false
-        timeout: 120
+        // Removed: timeout (not a valid ingress property in 2023-05-01 schema)
       }
       registries: !empty(containerRegistryPassword) ? [
         {
@@ -42,9 +46,8 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
           }
         ] : []
       )
-      daprConfig: {
-        enabled: false
-      }
+      // Removed: daprConfig (invalid property name; valid is `dapr`).
+      // Dapr is disabled by default — no explicit block needed.
     }
     template: {
       containers: [
@@ -97,7 +100,8 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
         }
       ] : []
       scale: {
-        minReplicas: 0
+        // Dedicated workload profiles do not support scale-to-zero; minimum is 1.
+        minReplicas: 1
         maxReplicas: 1
       }
     }
