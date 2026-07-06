@@ -1,5 +1,6 @@
-# Stage: runtime
-FROM nvidia/cuda:12.1-runtime-ubuntu22.04
+# CPU-only base: Azure Container Apps has no GPU; python:3.11-slim provides
+# Python 3.11 + pip without pulling a multi-GB CUDA runtime layer.
+FROM python:3.11-slim
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
@@ -7,11 +8,8 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install system dependencies
+# Install system dependencies for image processing and OpenMP (torch)
 RUN apt-get update && apt-get install -y \
-    python3.11 \
-    python3-pip \
-    python3-venv \
     git \
     libglib2.0-0 \
     libsm6 \
@@ -23,9 +21,11 @@ RUN apt-get update && apt-get install -y \
 # Create app directory
 WORKDIR /app
 
-# Copy requirements and install Python dependencies
+# Install CPU-only torch first so pip resolves torch==2.1.2 from the CPU index
+# and skips the multi-GB CUDA wheel from PyPI.
 COPY requirements.txt .
 RUN pip install --upgrade pip setuptools wheel && \
+    pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cpu && \
     pip install -r requirements.txt
 
 # Copy application code
