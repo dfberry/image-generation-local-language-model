@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "${AZURE_LOCATION}"
+    },
+    "containerAppName": {
+      "value": "${containerAppName=sdxl-generation-api}"
+    },
+    "environmentName": {
+      "value": "${environmentName=sdxl-env}"
+    },
+    "containerRegistryUrl": {
+      "value": "${AZURE_CONTAINER_REGISTRY_ENDPOINT}"
+    },
+    "apiExists": {
+      "value": "${SERVICE_API_RESOURCE_EXISTS=false}"
+    }
+  }
+}

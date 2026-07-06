@@ -5,7 +5,14 @@ param environmentName string = 'sdxl-env'
 param containerRegistryUrl string = ''
 // azd sets this to true after first provision; allows bicep to read the
 // currently-deployed image rather than re-specifying it each run.
+// Wired to ${SERVICE_API_RESOURCE_EXISTS} via infra/main.parameters.json —
+// without that wiring this stays false forever and the app is stuck running
+// the placeholder http.server command instead of the real Flask app.
 param apiExists bool = false
+
+// Azure Files storage account for the persistent HuggingFace model cache.
+// Globally-unique, deterministic per resource group.
+param modelStorageAccountName string = 'sdxlmodels${uniqueString(resourceGroup().id)}'
 
 // Locals
 var acrUrl = !empty(containerRegistryUrl) ? containerRegistryUrl : '${containerRegistryName}.azurecr.io'
@@ -38,6 +45,21 @@ module caEnvironment 'resources/aca-env.bicep' = {
   }
 }
 
+// Azure Files share for the SDXL model cache, registered on the environment
+// as 'models-storage'. Created regardless of apiExists so the share is ready
+// before the real container (exists=true) mounts it.
+module storage 'resources/storage.bicep' = {
+  name: 'storage-deployment'
+  params: {
+    location: location
+    storageAccountName: modelStorageAccountName
+    environmentName: environmentName
+  }
+  dependsOn: [
+    caEnvironment
+  ]
+}
+
 // Container App
 module containerApp 'resources/aca.bicep' = {
   name: 'container-app-deployment'
@@ -48,6 +70,8 @@ module containerApp 'resources/aca.bicep' = {
     containerRegistryUrl: acrUrl
     uamiId: identity.outputs.identityId
     exists: apiExists
+    storageAccountName: storage.outputs.storageAccountName
+    storageAccountKey: storage.outputs.storageAccountKey
   }
 }
 
@@ -58,3 +82,4 @@ output AZURE_CONTAINER_REGISTRY_ENDPOINT string = acr.outputs.loginServer
 output containerAppUrl string = containerApp.outputs.fqdn
 output containerAppName string = containerApp.outputs.containerAppName
 output environmentId string = caEnvironment.outputs.environmentId
+output modelStorageAccountName string = storage.outputs.storageAccountName
