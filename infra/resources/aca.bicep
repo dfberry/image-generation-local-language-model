@@ -22,7 +22,7 @@ resource existingApp 'Microsoft.App/containerApps@2023-05-01' existing = if (exi
 }
 
 var realImage = exists
-  ? (existingApp.properties.template.containers[0].image ?? 'python:3.11-slim')
+  ? (existingApp!.properties.template.containers[0].image ?? 'python:3.11-slim')
   : 'python:3.11-slim'
 
 // Placeholder container: python:3.11-slim + python3 -m http.server 8000.
@@ -44,11 +44,12 @@ var placeholderContainer = {
   probes: []
 }
 
-// Real app container: image read from the running app, no command override
-// (uses Dockerfile CMD: python3 app.py), full /health probes.
+// Real app container: image read from the running app, explicitly clears the
+// placeholder command override so Dockerfile CMD runs, full /health probes.
 var realContainer = {
   name: 'sdxl-api'
   image: realImage
+  command: []
   resources: {
     cpu: json('4')
     memory: '16Gi'

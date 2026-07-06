@@ -210,3 +210,15 @@ The crash-loop was caused by **ACA's platform-level default probe**: when ingres
 - Readiness: `/health:8000`, initialDelay 30s, period 10s ✅
 
 Validation: both `apiExists=false` and `apiExists=true` → `provisioningState: Succeeded, error: null`.
+
+---
+
+### RF-3 — Placeholder command override leaked into real container
+
+**Symptom:** The real ACR image was deployed, but `/health` and `/ui` returned `http.server` 404 responses. The container was running `python3 -m http.server 8000` instead of the app entrypoint.
+
+**Root cause:** The placeholder command override (`python3 -m http.server 8000`) was still present when `apiExists=true`. That override replaced the Dockerfile `CMD ["python3", "app.py"]`, so the SDXL API process never started.
+
+**Live hotfix applied (2026-07-06):** `az containerapp update --command python3 app.py`
+
+**Durable fix (`aca.bicep`):** Keep the placeholder command only for `apiExists=false`. For `apiExists=true`, explicitly emit an empty command array (`command: []`) so Container Apps clears the placeholder override and runs the Dockerfile CMD. The `python:3.11-slim` placeholder image branch remains unchanged, and the 300s startup probe remains gated to the real container branch only.
