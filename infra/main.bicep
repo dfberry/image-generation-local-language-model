@@ -60,6 +60,18 @@ module storage 'resources/storage.bicep' = {
   ]
 }
 
+// Read the currently-deployed image (if any) in a SEPARATE module scope. Doing
+// this read inside aca.bicep (which deploys the same container app) makes ARM
+// detect a self-referential circular dependency. Isolating it here breaks the
+// cycle — this is the azd-standard fetch-latest-image pattern.
+module fetchImage 'resources/fetch-container-image.bicep' = {
+  name: 'fetch-image-deployment'
+  params: {
+    exists: apiExists
+    name: containerAppName
+  }
+}
+
 // Container App
 module containerApp 'resources/aca.bicep' = {
   name: 'container-app-deployment'
@@ -70,6 +82,7 @@ module containerApp 'resources/aca.bicep' = {
     containerRegistryUrl: acrUrl
     uamiId: identity.outputs.identityId
     exists: apiExists
+    image: fetchImage.outputs.image
     storageAccountName: storage.outputs.storageAccountName
     storageAccountKey: storage.outputs.storageAccountKey
   }

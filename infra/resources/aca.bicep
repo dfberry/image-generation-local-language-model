@@ -4,6 +4,7 @@ param containerAppsEnvironmentId string
 param containerRegistryUrl string
 param uamiId string                    // Resource ID of the user-assigned managed identity
 param exists bool = false              // Set by azd: true after first provision; false on first run
+param image string = ''                // Current running image, resolved by the fetch-container-image module (empty on first run)
 param storageAccountName string = ''
 @secure()
 param storageAccountKey string = ''
@@ -15,15 +16,10 @@ param workloadProfileName string = 'dedicated-d4'
 // minimal HTTP server on port 8000. This satisfies ACA's default targetPort
 // health check (which fires even when probes:[] is set) and prevents the
 // crash-loop that deadlocks the rolling update. On subsequent provisions
-// (exists=true), read the image the running app is already using so a
+// (exists=true), the `image` param carries the image the running app is
+// already using (resolved by the fetch-container-image module) so a
 // re-provision never clobbers a deployed revision.
-resource existingApp 'Microsoft.App/containerApps@2023-05-01' existing = if (exists) {
-  name: containerAppName
-}
-
-var realImage = exists
-  ? (existingApp!.properties.template.containers[0].image ?? 'python:3.11-slim')
-  : 'python:3.11-slim'
+var realImage = !empty(image) ? image : 'python:3.11-slim'
 
 // Placeholder container: python:3.11-slim + python3 -m http.server 8000.
 // No probes — the HTTP server satisfies ACA's default targetPort TCP check.
