@@ -447,434 +447,428 @@ def model_status():
 
 @app.route("/ui", methods=["GET"])
 def browser_ui():
-    """Serve a self-contained browser UI for health, model management, and image generation."""
-    html = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SDXL Image Generator</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui,sans-serif;background:#0f0f13;color:#e2e2e6;min-height:100vh;padding:1.5rem}
-h1{font-size:1.6rem;font-weight:700;margin-bottom:1.5rem;color:#a78bfa}
-h2{font-size:1.1rem;font-weight:600;margin-bottom:.75rem;color:#c4b5fd}
-.card{background:#1a1a24;border:1px solid #2d2d40;border-radius:10px;padding:1.25rem;margin-bottom:1.25rem}
-.row{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap;margin-bottom:.5rem}
-.badge{display:inline-block;padding:.2rem .6rem;border-radius:20px;font-size:.75rem;font-weight:600;text-transform:uppercase}
-.badge-ok{background:#14532d;color:#4ade80}
-.badge-warn{background:#713f12;color:#fbbf24}
-.badge-error{background:#450a0a;color:#f87171}
-.badge-info{background:#1e3a5f;color:#60a5fa}
-.badge-grey{background:#27272a;color:#a1a1aa}
-button{background:#7c3aed;color:#fff;border:none;border-radius:6px;padding:.45rem .9rem;font-size:.85rem;cursor:pointer;font-weight:600;transition:background .15s}
-button:hover{background:#6d28d9}
-button:disabled{background:#3f3f46;color:#71717a;cursor:not-allowed}
-button.secondary{background:#27272a;color:#e2e2e6}
-button.secondary:hover{background:#3f3f46}
-button.danger{background:#b91c1c}
-button.danger:hover{background:#991b1b}
-.mono{font-family:monospace;font-size:.8rem;color:#94a3b8}
-label{display:block;font-size:.8rem;font-weight:500;color:#a1a1aa;margin-bottom:.25rem}
-input[type=text],input[type=number],select,textarea{width:100%;background:#0f0f13;border:1px solid #3f3f46;border-radius:6px;color:#e2e2e6;padding:.4rem .6rem;font-size:.85rem;font-family:inherit}
-input[type=text]:focus,input[type=number]:focus,select:focus,textarea:focus{outline:none;border-color:#7c3aed}
-textarea{resize:vertical;min-height:120px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:.75rem}
-.spinner{display:inline-block;width:16px;height:16px;border:2px solid #7c3aed;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:.4rem}
-@keyframes spin{to{transform:rotate(360deg)}}
-.hidden{display:none}
-.img-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:1rem;margin-top:1rem}
-.img-card{background:#0f0f13;border:1px solid #2d2d40;border-radius:8px;overflow:hidden}
-.img-card img{width:100%;display:block}
-.img-card .img-meta{padding:.6rem;display:flex;flex-direction:column;gap:.4rem}
-.img-card .img-meta p{font-size:.75rem;color:#94a3b8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.error-box{background:#450a0a;border:1px solid #b91c1c;border-radius:6px;padding:.75rem;margin-top:.5rem;font-size:.85rem;color:#fca5a5}
-.progress-bar{width:100%;height:4px;background:#27272a;border-radius:2px;overflow:hidden;margin-top:.5rem}
-.progress-bar-fill{height:100%;background:#7c3aed;border-radius:2px;transition:width .3s}
-.tabs{display:flex;gap:0;margin-bottom:1rem;border-bottom:1px solid #2d2d40}
-.tab{padding:.5rem 1rem;cursor:pointer;font-size:.85rem;font-weight:500;color:#71717a;border-bottom:2px solid transparent;margin-bottom:-1px}
-.tab.active{color:#a78bfa;border-bottom-color:#a78bfa}
-.tab-panel{display:none}
-.tab-panel.active{display:block}
-.hint{font-size:.75rem;color:#71717a;margin-top:.25rem}
-.checkbox-row{display:flex;align-items:center;gap:.5rem}
-.checkbox-row input{width:auto}
-.status-line{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
-.elapsed{font-size:.75rem;color:#71717a}
-a.dl-link{display:inline-block;margin-top:.25rem;padding:.3rem .6rem;background:#27272a;color:#a78bfa;border-radius:4px;font-size:.75rem;text-decoration:none;font-weight:600}
-a.dl-link:hover{background:#3f3f46}
-</style>
-</head>
-<body>
-<h1>🎨 SDXL Image Generator</h1>
-
-<!-- Health Card -->
-<div class="card" id="health-card">
-  <div class="row">
-    <h2>Server Health</h2>
-    <button class="secondary" onclick="refreshHealth()">↻ Refresh</button>
-    <span id="health-auto-label" class="mono" style="font-size:.7rem;color:#52525b"></span>
-  </div>
-  <div class="status-line" id="health-status-line">
-    <span class="badge badge-grey" id="health-badge">—</span>
-    <span class="mono" id="health-device"></span>
-    <span class="elapsed" id="health-ts"></span>
-  </div>
-</div>
-
-<!-- Model Card -->
-<div class="card" id="model-card">
-  <div class="row">
-    <h2>Model Status</h2>
-    <button onclick="pullModel()" id="btn-pull">⬇ Download / Warm Up Model</button>
-    <button class="secondary" onclick="refreshModel()">↻ Refresh</button>
-  </div>
-  <div class="status-line" id="model-status-line">
-    <span class="badge badge-grey" id="model-badge">—</span>
-    <span class="mono" id="model-msg"></span>
-  </div>
-  <div id="model-progress" class="hidden">
-    <div class="progress-bar"><div class="progress-bar-fill" id="model-progress-fill" style="width:30%"></div></div>
-  </div>
-  <div class="elapsed" id="model-elapsed" style="margin-top:.4rem"></div>
-  <div class="error-box hidden" id="model-error"></div>
-</div>
-
-<!-- Generate Card -->
-<div class="card">
-  <h2>Generate Images</h2>
-  <p class="hint" style="margin-bottom:.75rem">💡 For a quick smoke test on CPU, use Steps=20 and 512×512.</p>
-
-  <div class="tabs">
-    <div class="tab active" onclick="switchTab('prompt')" id="tab-prompt">✏️ Free-text prompt</div>
-    <div class="tab" onclick="switchTab('batch')" id="tab-batch">📄 Batch JSON</div>
-  </div>
-
-  <!-- Prompt tab -->
-  <div class="tab-panel active" id="panel-prompt">
-    <div style="margin-bottom:.75rem">
-      <label>Prompt *</label>
-      <input type="text" id="prompt-text" placeholder="a serene mountain lake at sunrise, golden light, photorealistic">
-    </div>
-    <div style="margin-bottom:.75rem">
-      <label>Negative prompt (optional)</label>
-      <input type="text" id="prompt-neg" placeholder="blur, noise, cartoon">
-    </div>
-    <div class="grid3" style="margin-bottom:.75rem">
-      <div>
-        <label>Steps (1–150)</label>
-        <input type="number" id="p-steps" value="20" min="1" max="150">
-      </div>
-      <div>
-        <label>Guidance (0–50)</label>
-        <input type="number" id="p-guidance" value="7.5" min="0" max="50" step="0.5">
-      </div>
-      <div>
-        <label>Seed (blank = random)</label>
-        <input type="number" id="p-seed" placeholder="42">
-      </div>
-    </div>
-    <div class="grid2" style="margin-bottom:.75rem">
-      <div>
-        <label>Width</label>
-        <select id="p-width">
-          <option value="512" selected>512</option>
-          <option value="768">768</option>
-          <option value="1024">1024</option>
-        </select>
-      </div>
-      <div>
-        <label>Height</label>
-        <select id="p-height">
-          <option value="512" selected>512</option>
-          <option value="768">768</option>
-          <option value="1024">1024</option>
-        </select>
-      </div>
-    </div>
-    <div class="row" style="margin-bottom:.75rem">
-      <div class="checkbox-row">
-        <input type="checkbox" id="p-refine">
-        <label style="margin:0" for="p-refine">Use refiner (slower, higher quality)</label>
-      </div>
-      <div class="checkbox-row">
-        <input type="checkbox" id="p-cpu" checked>
-        <label style="margin:0" for="p-cpu">Force CPU</label>
-      </div>
-    </div>
-  </div>
-
-  <!-- Batch tab -->
-  <div class="tab-panel" id="panel-batch">
-    <div style="margin-bottom:.5rem">
-      <label>Upload batch JSON file</label>
-      <input type="file" id="batch-file" accept=".json,application/json" style="background:transparent;border:none;padding:0;color:#94a3b8">
-    </div>
-    <div>
-      <label>Or paste / edit batch JSON</label>
-      <textarea id="batch-json" placeholder='{"prompts":[{"prompt":"a tropical sunset","seed":42}],"steps":20,"width":512,"height":512}'></textarea>
-    </div>
-    <p class="hint">Shape: <code>{"prompts":[{"prompt":"...","seed":42}],"steps":20,"width":512,"height":512}</code></p>
-  </div>
-
-  <div style="margin-top:1rem;display:flex;gap:.75rem;align-items:center;flex-wrap:wrap">
-    <button onclick="generate()" id="btn-generate">🚀 Generate</button>
-    <span id="gen-spinner" class="hidden"><span class="spinner"></span>Generating… (may take minutes on CPU)</span>
-    <button class="secondary hidden" id="btn-dl-all" onclick="downloadAll()">⬇ Download all</button>
-  </div>
-  <div class="error-box hidden" id="gen-error"></div>
-  <div id="gen-results" class="img-grid"></div>
-</div>
-
-<script>
-const BASE = '';  // same origin
-
-// ── helpers ─────────────────────────────────────────────────────────────────
-function badgeClass(state){
-  if(state==='healthy'||state==='ready'||state==='ok') return 'badge-ok';
-  if(state==='in_progress') return 'badge-info';
-  if(state==='error') return 'badge-error';
-  if(state==='not_started') return 'badge-grey';
-  return 'badge-warn';
-}
-function setBadge(el,text,cls){
-  el.textContent=text;
-  el.className='badge '+cls;
-}
-function showError(el,msg){el.textContent=msg;el.classList.remove('hidden')}
-function hideError(el){el.classList.add('hidden')}
-
-// ── health ───────────────────────────────────────────────────────────────────
-let _healthTimer=null;
-async function refreshHealth(){
-  const badge=document.getElementById('health-badge');
-  const dev=document.getElementById('health-device');
-  const ts=document.getElementById('health-ts');
-  try{
-    const r=await fetch(BASE+'/health');
-    const d=await r.json();
-    setBadge(badge,d.status||'?',badgeClass(d.status));
-    dev.textContent=d.device?'device: '+d.device:'';
-    ts.textContent=d.timestamp?new Date(d.timestamp).toLocaleTimeString():'';
-  }catch(e){
-    setBadge(badge,'unreachable','badge-error');
-    dev.textContent='';
-    ts.textContent='';
-  }
-}
-function startHealthPoll(){
-  refreshHealth();
-  document.getElementById('health-auto-label').textContent='auto-refreshes every 15s';
-  _healthTimer=setInterval(refreshHealth,15000);
-}
-
-// ── model ────────────────────────────────────────────────────────────────────
-let _modelPollTimer=null;
-async function refreshModel(){
-  const badge=document.getElementById('model-badge');
-  const msg=document.getElementById('model-msg');
-  const elapsed=document.getElementById('model-elapsed');
-  const prog=document.getElementById('model-progress');
-  const err=document.getElementById('model-error');
-  const btn=document.getElementById('btn-pull');
-  try{
-    const r=await fetch(BASE+'/model/status');
-    const d=await r.json();
-    const state=d.state||'unknown';
-    setBadge(badge,state,badgeClass(state));
-    msg.textContent=d.message||'';
-    elapsed.textContent=d.elapsed_seconds!=null?('⏱ '+d.elapsed_seconds.toFixed(1)+'s'):'';
-    if(state==='in_progress'){
-      prog.classList.remove('hidden');
-      btn.disabled=true;
-      ensureModelPoll();
-    } else {
-      prog.classList.add('hidden');
-      btn.disabled=false;
-      stopModelPoll();
-    }
-    if(state==='error'&&d.error){
-      showError(err,d.error);
-    } else {
-      hideError(err);
-    }
-    // warn generate button if not ready
-    document.getElementById('btn-generate').title=
-      state==='ready'?'':'Model not ready — generation may fail or be slow. Pull model first.';
-  }catch(e){
-    setBadge(badge,'fetch error','badge-error');
-    msg.textContent=String(e);
-  }
-}
-function ensureModelPoll(){
-  if(!_modelPollTimer) _modelPollTimer=setInterval(refreshModel,5000);
-}
-function stopModelPoll(){
-  if(_modelPollTimer){clearInterval(_modelPollTimer);_modelPollTimer=null;}
-}
-async function pullModel(){
-  const btn=document.getElementById('btn-pull');
-  btn.disabled=true;
-  hideError(document.getElementById('model-error'));
-  try{
-    const r=await fetch(BASE+'/model/pull',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
-    const d=await r.json();
-    document.getElementById('model-badge').textContent=d.state||'?';
-    document.getElementById('model-msg').textContent=d.message||'';
-    ensureModelPoll();
-  }catch(e){
-    btn.disabled=false;
-    showError(document.getElementById('model-error'),'Failed to start pull: '+String(e));
-  }
-}
-
-// ── tabs ─────────────────────────────────────────────────────────────────────
-function switchTab(name){
-  ['prompt','batch'].forEach(t=>{
-    document.getElementById('tab-'+t).classList.toggle('active',t===name);
-    document.getElementById('panel-'+t).classList.toggle('active',t===name);
-  });
-}
-// file picker fills textarea
-document.getElementById('batch-file').addEventListener('change',function(){
-  const f=this.files[0];if(!f)return;
-  const reader=new FileReader();
-  reader.onload=e=>{document.getElementById('batch-json').value=e.target.result;};
-  reader.readAsText(f);
-});
-
-// ── generate ─────────────────────────────────────────────────────────────────
-let _lastResults=[];
-async function generate(){
-  const btn=document.getElementById('btn-generate');
-  const spinner=document.getElementById('gen-spinner');
-  const errEl=document.getElementById('gen-error');
-  const resultsEl=document.getElementById('gen-results');
-  const dlAll=document.getElementById('btn-dl-all');
-
-  hideError(errEl);
-  resultsEl.innerHTML='';
-  dlAll.classList.add('hidden');
-  _lastResults=[];
-  btn.disabled=true;
-  spinner.classList.remove('hidden');
-
-  let body;
-  // Determine active tab
-  const isPromptTab=document.getElementById('panel-prompt').classList.contains('active');
-  if(isPromptTab){
-    const p=document.getElementById('prompt-text').value.trim();
-    if(!p){
-      showError(errEl,'Prompt is required.');
-      btn.disabled=false;spinner.classList.add('hidden');return;
-    }
-    const promptObj={prompt:p};
-    const neg=document.getElementById('prompt-neg').value.trim();
-    if(neg) promptObj.negative_prompt=neg;
-    const seed=document.getElementById('p-seed').value.trim();
-    if(seed) promptObj.seed=parseInt(seed,10);
-    body={
-      prompts:[promptObj],
-      steps:parseInt(document.getElementById('p-steps').value,10)||20,
-      guidance:parseFloat(document.getElementById('p-guidance').value)||7.5,
-      width:parseInt(document.getElementById('p-width').value,10)||512,
-      height:parseInt(document.getElementById('p-height').value,10)||512,
-      refine:document.getElementById('p-refine').checked,
-      cpu:document.getElementById('p-cpu').checked,
-    };
-  } else {
-    const raw=document.getElementById('batch-json').value.trim();
-    if(!raw){
-      showError(errEl,'Paste or upload a batch JSON file.');
-      btn.disabled=false;spinner.classList.add('hidden');return;
-    }
-    try{body=JSON.parse(raw);}
-    catch(e){
-      showError(errEl,'Invalid JSON: '+e.message);
-      btn.disabled=false;spinner.classList.add('hidden');return;
-    }
-  }
-
-  try{
-    const r=await fetch(BASE+'/generate',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(body),
-    });
-    const data=await r.json();
-    if(data.status!=='success'){
-      showError(errEl,'Server error: '+(data.error||JSON.stringify(data)));
-      return;
-    }
-    _lastResults=data.results||[];
-    renderResults(_lastResults,resultsEl);
-    if(_lastResults.some(r=>r.image_base64)) dlAll.classList.remove('hidden');
-  }catch(e){
-    showError(errEl,'Request failed: '+String(e));
-  }finally{
-    btn.disabled=false;
-    spinner.classList.add('hidden');
-  }
-}
-
-function renderResults(results,container){
-  container.innerHTML='';
-  results.forEach((r,i)=>{
-    const div=document.createElement('div');
-    div.className='img-card';
-    if(r.status==='ok'&&r.image_base64){
-      const img=document.createElement('img');
-      img.src='data:image/png;base64,'+r.image_base64;
-      img.alt=r.prompt||'Generated image '+i;
-      div.appendChild(img);
-      const meta=document.createElement('div');
-      meta.className='img-meta';
-      const pp=document.createElement('p');
-      pp.title=r.prompt||'';
-      pp.textContent=(r.prompt||'').substring(0,80)||(r.filename||'image');
-      meta.appendChild(pp);
-      const a=document.createElement('a');
-      a.className='dl-link';
-      a.href='data:image/png;base64,'+r.image_base64;
-      a.download=r.filename||('image-'+i+'.png');
-      a.textContent='⬇ Download';
-      meta.appendChild(a);
-      div.appendChild(meta);
-    } else {
-      const meta=document.createElement('div');
-      meta.className='img-meta';
-      const errDiv=document.createElement('div');
-      errDiv.className='error-box';
-      errDiv.style.margin='0';
-      errDiv.textContent='Error: '+(r.error||r.status||'unknown error');
-      meta.appendChild(errDiv);
-      const pp=document.createElement('p');
-      pp.textContent=(r.prompt||'').substring(0,80);
-      meta.appendChild(pp);
-      div.appendChild(meta);
-    }
-    container.appendChild(div);
-  });
-}
-
-function downloadAll(){
-  _lastResults.forEach((r,i)=>{
-    if(r.status==='ok'&&r.image_base64){
-      const a=document.createElement('a');
-      a.href='data:image/png;base64,'+r.image_base64;
-      a.download=r.filename||('image-'+i+'.png');
-      document.body.appendChild(a);a.click();document.body.removeChild(a);
-    }
-  });
-}
-
-// ── init ─────────────────────────────────────────────────────────────────────
-startHealthPoll();
-refreshModel();
-</script>
-</body>
-</html>"""
+    """Serve a self-contained browser console — one section per endpoint."""
+    html = (
+        '<!DOCTYPE html>\n'
+        '<html lang="en">\n'
+        '<head>\n'
+        '<meta charset="UTF-8">\n'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">\n'
+        '<title>SDXL API Console</title>\n'
+        '<style>\n'
+        '*{box-sizing:border-box;margin:0;padding:0}\n'
+        'body{font-family:system-ui,sans-serif;background:#0f0f13;color:#e2e2e6;padding:1.5rem 1.5rem 3rem}\n'
+        'h1{font-size:1.5rem;font-weight:700;color:#a78bfa;margin-bottom:.4rem}\n'
+        '.subtitle{font-size:.8rem;color:#52525b;margin-bottom:1.5rem}\n'
+        '.card{background:#1a1a24;border:1px solid #2d2d40;border-radius:10px;padding:1.25rem;margin-bottom:1.25rem}\n'
+        '.card-header{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;margin-bottom:.9rem}\n'
+        '.method{font-size:.7rem;font-weight:700;padding:.2rem .5rem;border-radius:4px;text-transform:uppercase;letter-spacing:.05em}\n'
+        '.get{background:#14532d;color:#4ade80}.post{background:#1e3a5f;color:#60a5fa}\n'
+        '.path{font-family:monospace;font-size:.9rem;color:#e2e2e6;font-weight:600}\n'
+        '.desc{font-size:.78rem;color:#71717a;flex:1}\n'
+        '.controls{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-bottom:.75rem}\n'
+        'button{background:#7c3aed;color:#fff;border:none;border-radius:6px;padding:.4rem .85rem;font-size:.82rem;cursor:pointer;font-weight:600;transition:background .15s}\n'
+        'button:hover{background:#6d28d9}\n'
+        'button:disabled{background:#3f3f46;color:#71717a;cursor:not-allowed}\n'
+        'button.sec{background:#27272a;color:#e2e2e6}\n'
+        'button.sec:hover{background:#3f3f46}\n'
+        '.toggle-label{font-size:.78rem;color:#a1a1aa;display:flex;align-items:center;gap:.35rem;cursor:pointer;user-select:none}\n'
+        '.toggle-label input{width:auto;cursor:pointer}\n'
+        '.field{margin-bottom:.65rem}\n'
+        'label{display:block;font-size:.78rem;font-weight:500;color:#a1a1aa;margin-bottom:.2rem}\n'
+        'input[type=text],input[type=number],select,textarea{width:100%;background:#0f0f13;border:1px solid #3f3f46;border-radius:6px;color:#e2e2e6;padding:.38rem .6rem;font-size:.83rem;font-family:inherit}\n'
+        'input:focus,select:focus,textarea:focus{outline:none;border-color:#7c3aed}\n'
+        'textarea{resize:vertical;min-height:110px}\n'
+        '.grid2{display:grid;grid-template-columns:1fr 1fr;gap:.65rem}\n'
+        '.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:.65rem}\n'
+        '.cbrow{display:flex;align-items:center;gap:.4rem;font-size:.82rem;color:#a1a1aa}\n'
+        '.cbrow input{width:auto}\n'
+        '.spinner{display:inline-block;width:14px;height:14px;border:2px solid #7c3aed;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:.3rem}\n'
+        '@keyframes spin{to{transform:rotate(360deg)}}\n'
+        '.hidden{display:none}\n'
+        '.badge{display:inline-block;padding:.15rem .55rem;border-radius:20px;font-size:.72rem;font-weight:700;text-transform:uppercase}\n'
+        '.ok{background:#14532d;color:#4ade80}.info{background:#1e3a5f;color:#60a5fa}\n'
+        '.err{background:#450a0a;color:#f87171}.grey{background:#27272a;color:#a1a1aa}\n'
+        '.warn{background:#713f12;color:#fbbf24}\n'
+        '.response-wrap{margin-top:.75rem}\n'
+        'details{border:1px solid #2d2d40;border-radius:6px;overflow:hidden}\n'
+        'summary{padding:.4rem .7rem;font-size:.78rem;font-weight:600;color:#94a3b8;cursor:pointer;background:#111118;list-style:none;display:flex;align-items:center;gap:.5rem}\n'
+        'summary::-webkit-details-marker{display:none}\n'
+        'summary::before{content:"\\25B6";font-size:.6rem;transition:transform .15s}\n'
+        'details[open] summary::before{transform:rotate(90deg)}\n'
+        'pre{background:#0a0a0f;color:#a5f3fc;font-size:.75rem;padding:.75rem;overflow-x:auto;max-height:320px;white-space:pre-wrap;word-break:break-all}\n'
+        '.status-row{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;font-size:.83rem;margin-bottom:.3rem}\n'
+        '.elapsed{font-size:.72rem;color:#71717a}\n'
+        '.err-box{background:#450a0a;border:1px solid #7f1d1d;border-radius:6px;padding:.6rem;font-size:.82rem;color:#fca5a5;margin-top:.4rem}\n'
+        '.progress{width:100%;height:3px;background:#27272a;border-radius:2px;margin-top:.5rem}\n'
+        '.progress-fill{height:100%;background:#7c3aed;border-radius:2px;animation:pulse-width 2s ease-in-out infinite}\n'
+        '@keyframes pulse-width{0%{width:15%}50%{width:75%}100%{width:15%}}\n'
+        '.tabs{display:flex;border-bottom:1px solid #2d2d40;margin-bottom:.75rem}\n'
+        '.tab{padding:.4rem .9rem;cursor:pointer;font-size:.82rem;font-weight:500;color:#71717a;border-bottom:2px solid transparent;margin-bottom:-1px}\n'
+        '.tab.on{color:#a78bfa;border-bottom-color:#a78bfa}\n'
+        '.tp{display:none}.tp.on{display:block}\n'
+        '.img-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:.9rem;margin-top:.9rem}\n'
+        '.img-card{background:#111118;border:1px solid #2d2d40;border-radius:8px;overflow:hidden}\n'
+        '.img-card img{width:100%;display:block}\n'
+        '.img-meta{padding:.55rem;display:flex;flex-direction:column;gap:.3rem}\n'
+        '.img-meta p{font-size:.72rem;color:#71717a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n'
+        'a.dl{display:inline-block;padding:.25rem .55rem;background:#27272a;color:#a78bfa;border-radius:4px;font-size:.72rem;text-decoration:none;font-weight:600}\n'
+        'a.dl:hover{background:#3f3f46}\n'
+        '.hint{font-size:.72rem;color:#52525b;margin-top:.2rem}\n'
+        'hr{border:none;border-top:1px solid #1f1f2e;margin:.3rem 0 .7rem}\n'
+        '</style>\n'
+        '</head>\n'
+        '<body>\n'
+        '<h1>SDXL API Console</h1>\n'
+        '<p class="subtitle">One section per endpoint. Every call shows the raw JSON response.</p>\n'
+        '\n'
+        '<!-- 1. GET / -->\n'
+        '<div class="card">\n'
+        '  <div class="card-header">\n'
+        '    <span class="method get">GET</span><span class="path">/</span>\n'
+        '    <span class="desc">API info &amp; endpoint listing</span>\n'
+        '  </div>\n'
+        '  <div class="controls">\n'
+        '    <button onclick="callRoot()">Get API info</button>\n'
+        '    <span id="root-spin" class="hidden"><span class="spinner"></span></span>\n'
+        '  </div>\n'
+        '  <div id="root-resp" class="response-wrap hidden">\n'
+        '    <details open><summary>JSON response</summary><pre id="root-pre"></pre></details>\n'
+        '  </div>\n'
+        '</div>\n'
+        '\n'
+        '<!-- 2. GET /health -->\n'
+        '<div class="card">\n'
+        '  <div class="card-header">\n'
+        '    <span class="method get">GET</span><span class="path">/health</span>\n'
+        '    <span class="desc">Server health &amp; device</span>\n'
+        '  </div>\n'
+        '  <div class="controls">\n'
+        '    <button onclick="callHealth()">Check health</button>\n'
+        '    <span id="health-spin" class="hidden"><span class="spinner"></span></span>\n'
+        '    <label class="toggle-label"><input type="checkbox" id="health-auto" onchange="toggleHealthPoll()"> auto-poll every 10 s</label>\n'
+        '  </div>\n'
+        '  <div id="health-result" class="hidden">\n'
+        '    <div class="status-row">\n'
+        '      <span class="badge grey" id="health-badge">—</span>\n'
+        '      <span id="health-device" style="font-size:.82rem;color:#94a3b8"></span>\n'
+        '      <span class="elapsed" id="health-ts"></span>\n'
+        '    </div>\n'
+        '    <details><summary>JSON response</summary><pre id="health-pre"></pre></details>\n'
+        '  </div>\n'
+        '</div>\n'
+        '\n'
+        '<!-- 3. GET /model/status -->\n'
+        '<div class="card">\n'
+        '  <div class="card-header">\n'
+        '    <span class="method get">GET</span><span class="path">/model/status</span>\n'
+        '    <span class="desc">Current model warm-up state</span>\n'
+        '  </div>\n'
+        '  <div class="controls">\n'
+        '    <button onclick="callModelStatus()">Check model status</button>\n'
+        '    <span id="mstatus-spin" class="hidden"><span class="spinner"></span></span>\n'
+        '    <label class="toggle-label"><input type="checkbox" id="mstatus-auto" onchange="toggleMStatusPoll()"> auto-poll every 5 s</label>\n'
+        '  </div>\n'
+        '  <div id="mstatus-result" class="hidden">\n'
+        '    <div class="status-row">\n'
+        '      <span class="badge grey" id="mstatus-badge">—</span>\n'
+        '      <span id="mstatus-msg" style="font-size:.82rem;color:#94a3b8"></span>\n'
+        '      <span class="elapsed" id="mstatus-elapsed"></span>\n'
+        '    </div>\n'
+        '    <div id="mstatus-err" class="err-box hidden"></div>\n'
+        '    <details><summary>JSON response</summary><pre id="mstatus-pre"></pre></details>\n'
+        '  </div>\n'
+        '</div>\n'
+        '\n'
+        '<!-- 4. POST /model/pull -->\n'
+        '<div class="card">\n'
+        '  <div class="card-header">\n'
+        '    <span class="method post">POST</span><span class="path">/model/pull</span>\n'
+        '    <span class="desc">Start async model download &amp; warm-up (returns 202)</span>\n'
+        '  </div>\n'
+        '  <div class="field">\n'
+        '    <label class="cbrow"><input type="checkbox" id="pull-force"> <span>force re-pull even if already ready</span></label>\n'
+        '  </div>\n'
+        '  <div class="controls">\n'
+        '    <button onclick="callModelPull()" id="btn-pull">Pull / warm up model</button>\n'
+        '    <span id="pull-spin" class="hidden"><span class="spinner"></span>Working…</span>\n'
+        '  </div>\n'
+        '  <div id="pull-result" class="hidden">\n'
+        '    <div class="status-row">\n'
+        '      <span class="badge grey" id="pull-badge">—</span>\n'
+        '      <span id="pull-msg" style="font-size:.82rem;color:#94a3b8"></span>\n'
+        '    </div>\n'
+        '    <div id="pull-progress" class="progress hidden"><div class="progress-fill"></div></div>\n'
+        '    <div id="pull-poll-status" class="status-row hidden" style="margin-top:.5rem">\n'
+        '      <span class="spinner"></span>\n'
+        '      <span style="font-size:.78rem;color:#71717a">Polling /model/status…</span>\n'
+        '      <span class="elapsed" id="pull-poll-elapsed"></span>\n'
+        '    </div>\n'
+        '    <div id="pull-err" class="err-box hidden"></div>\n'
+        '    <details><summary>JSON response (pull)</summary><pre id="pull-pre"></pre></details>\n'
+        '    <details id="pull-status-details" class="hidden" style="margin-top:.4rem"><summary>JSON response (latest status poll)</summary><pre id="pull-status-pre"></pre></details>\n'
+        '  </div>\n'
+        '</div>\n'
+        '\n'
+        '<!-- 5. POST /generate -->\n'
+        '<div class="card">\n'
+        '  <div class="card-header">\n'
+        '    <span class="method post">POST</span><span class="path">/generate</span>\n'
+        '    <span class="desc">Generate images from prompts</span>\n'
+        '  </div>\n'
+        '  <p class="hint" style="margin-bottom:.75rem">Tip: Steps=20, 512x512 for a fast CPU smoke-test. Generation can take several minutes on CPU.</p>\n'
+        '\n'
+        '  <div class="tabs">\n'
+        '    <div class="tab on" id="tab-prompt" onclick="switchTab(\'prompt\')">Free-text prompt</div>\n'
+        '    <div class="tab" id="tab-batch" onclick="switchTab(\'batch\')">Batch JSON</div>\n'
+        '  </div>\n'
+        '\n'
+        '  <div class="tp on" id="tp-prompt">\n'
+        '    <div class="field"><label>Prompt *</label><input type="text" id="p-prompt" placeholder="a serene mountain lake at sunrise, photorealistic"></div>\n'
+        '    <div class="field"><label>Negative prompt</label><input type="text" id="p-neg" placeholder="blur, noise, cartoon"></div>\n'
+        '    <div class="grid3" style="margin-bottom:.65rem">\n'
+        '      <div class="field"><label>Steps (1-150)</label><input type="number" id="p-steps" value="20" min="1" max="150"></div>\n'
+        '      <div class="field"><label>Guidance (0-50)</label><input type="number" id="p-guidance" value="7.5" min="0" max="50" step="0.5"></div>\n'
+        '      <div class="field"><label>Seed (blank=random)</label><input type="number" id="p-seed" placeholder="42"></div>\n'
+        '    </div>\n'
+        '    <div class="grid2" style="margin-bottom:.65rem">\n'
+        '      <div class="field"><label>Width</label><select id="p-width"><option value="512" selected>512</option><option value="768">768</option><option value="1024">1024</option></select></div>\n'
+        '      <div class="field"><label>Height</label><select id="p-height"><option value="512" selected>512</option><option value="768">768</option><option value="1024">1024</option></select></div>\n'
+        '    </div>\n'
+        '    <div style="display:flex;gap:1.2rem;flex-wrap:wrap;margin-bottom:.5rem">\n'
+        '      <label class="cbrow"><input type="checkbox" id="p-refine"> Use refiner</label>\n'
+        '      <label class="cbrow"><input type="checkbox" id="p-cpu" checked> Force CPU</label>\n'
+        '    </div>\n'
+        '  </div>\n'
+        '\n'
+        '  <div class="tp" id="tp-batch">\n'
+        '    <div class="field">\n'
+        '      <label>Upload batch JSON file</label>\n'
+        '      <input type="file" id="b-file" accept=".json,application/json" style="background:transparent;border:none;padding:0;color:#94a3b8">\n'
+        '    </div>\n'
+        '    <div class="field">\n'
+        '      <label>Or paste / edit batch JSON</label>\n'
+        '      <textarea id="b-json" placeholder=\'{"prompts":[{"prompt":"a tropical sunset","seed":42}],"steps":20,"width":512,"height":512}\'></textarea>\n'
+        '      <p class="hint">Shape: {"prompts":[{"prompt":"...","seed":42}],"steps":20,"width":512,"height":512}</p>\n'
+        '    </div>\n'
+        '  </div>\n'
+        '\n'
+        '  <div class="controls" style="margin-top:.5rem">\n'
+        '    <button onclick="callGenerate()" id="btn-gen">Generate</button>\n'
+        '    <span id="gen-spin" class="hidden"><span class="spinner"></span>Generating… (may take minutes on CPU)</span>\n'
+        '    <button class="sec hidden" id="btn-dl-all" onclick="downloadAll()">Download all images</button>\n'
+        '  </div>\n'
+        '  <div id="gen-err" class="err-box hidden"></div>\n'
+        '\n'
+        '  <div id="gen-resp" class="response-wrap hidden">\n'
+        '    <details><summary id="gen-resp-label">JSON response</summary><pre id="gen-pre"></pre></details>\n'
+        '  </div>\n'
+        '  <div id="gen-imgs" class="img-grid"></div>\n'
+        '</div>\n'
+        '\n'
+        '<script>\n'
+        'const B="";\n'
+        '\n'
+        '// helpers\n'
+        'function bc(s){if(s==="healthy"||s==="ready"||s==="ok")return"ok";if(s==="in_progress")return"info";if(s==="error")return"err";if(s==="not_started")return"grey";return"warn";}\n'
+        'function badge(el,txt,cls){el.textContent=txt;el.className="badge "+cls;}\n'
+        'function show(id){document.getElementById(id).classList.remove("hidden");}\n'
+        'function hide(id){document.getElementById(id).classList.add("hidden");}\n'
+        'function setText(id,t){document.getElementById(id).textContent=t;}\n'
+        'function setJson(id,obj){\n'
+        '  // strip image_base64 from display to keep pre readable\n'
+        '  const clone=JSON.parse(JSON.stringify(obj));\n'
+        '  if(clone.results)clone.results=clone.results.map(r=>{const c={...r};if(c.image_base64)c.image_base64="<base64 omitted>";return c;});\n'
+        '  document.getElementById(id).textContent=JSON.stringify(clone,null,2);\n'
+        '}\n'
+        '\n'
+        '// ── 1. GET / ────────────────────────────────────────────────────────\n'
+        'async function callRoot(){\n'
+        '  show("root-spin");hide("root-resp");\n'
+        '  try{\n'
+        '    const r=await fetch(B+"/");const d=await r.json();\n'
+        '    setJson("root-pre",d);show("root-resp");\n'
+        '  }catch(e){alert("Error: "+e);}\n'
+        '  finally{hide("root-spin");}\n'
+        '}\n'
+        '\n'
+        '// ── 2. GET /health ──────────────────────────────────────────────────\n'
+        'let _hTimer=null;\n'
+        'async function callHealth(){\n'
+        '  show("health-spin");\n'
+        '  try{\n'
+        '    const r=await fetch(B+"/health");const d=await r.json();\n'
+        '    badge(document.getElementById("health-badge"),d.status||"?",bc(d.status));\n'
+        '    setText("health-device",d.device?"device: "+d.device:"");\n'
+        '    setText("health-ts",d.timestamp?new Date(d.timestamp).toLocaleTimeString():"");\n'
+        '    setJson("health-pre",d);show("health-result");\n'
+        '  }catch(e){\n'
+        '    badge(document.getElementById("health-badge"),"unreachable","err");\n'
+        '    setText("health-device","");setText("health-ts","");\n'
+        '  }finally{hide("health-spin");}\n'
+        '}\n'
+        'function toggleHealthPoll(){\n'
+        '  if(document.getElementById("health-auto").checked){\n'
+        '    callHealth();_hTimer=setInterval(callHealth,10000);\n'
+        '  }else{clearInterval(_hTimer);_hTimer=null;}\n'
+        '}\n'
+        '\n'
+        '// ── 3. GET /model/status ────────────────────────────────────────────\n'
+        'let _msTimer=null;\n'
+        'async function callModelStatus(){\n'
+        '  show("mstatus-spin");\n'
+        '  try{\n'
+        '    const r=await fetch(B+"/model/status");const d=await r.json();\n'
+        '    const s=d.state||"unknown";\n'
+        '    badge(document.getElementById("mstatus-badge"),s,bc(s));\n'
+        '    setText("mstatus-msg",d.message||"");\n'
+        '    setText("mstatus-elapsed",d.elapsed_seconds!=null?"elapsed: "+d.elapsed_seconds.toFixed(1)+"s":"");\n'
+        '    if(s==="error"&&d.error){setText("mstatus-err",d.error);show("mstatus-err");}else{hide("mstatus-err");}\n'
+        '    setJson("mstatus-pre",d);show("mstatus-result");\n'
+        '  }catch(e){setText("mstatus-msg","fetch error: "+e);}finally{hide("mstatus-spin");}\n'
+        '}\n'
+        'function toggleMStatusPoll(){\n'
+        '  if(document.getElementById("mstatus-auto").checked){\n'
+        '    callModelStatus();_msTimer=setInterval(callModelStatus,5000);\n'
+        '  }else{clearInterval(_msTimer);_msTimer=null;}\n'
+        '}\n'
+        '\n'
+        '// ── 4. POST /model/pull ─────────────────────────────────────────────\n'
+        'let _pullPollTimer=null;\n'
+        'let _pullStart=null;\n'
+        'async function callModelPull(){\n'
+        '  const force=document.getElementById("pull-force").checked;\n'
+        '  document.getElementById("btn-pull").disabled=true;\n'
+        '  show("pull-spin");hide("pull-err");hide("pull-status-details");\n'
+        '  show("pull-result");\n'
+        '  try{\n'
+        '    const r=await fetch(B+"/model/pull",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({force:force})});\n'
+        '    const d=await r.json();\n'
+        '    setJson("pull-pre",d);\n'
+        '    badge(document.getElementById("pull-badge"),d.state||"?",bc(d.state));\n'
+        '    setText("pull-msg",d.message||"");\n'
+        '    if(d.state==="in_progress"){show("pull-progress");startPullPoll();}else{hide("pull-progress");}\n'
+        '    if(d.state==="error"&&d.error){setText("pull-err",d.error);show("pull-err");}\n'
+        '  }catch(e){setText("pull-err","Request failed: "+e);show("pull-err");}\n'
+        '  finally{hide("pull-spin");document.getElementById("btn-pull").disabled=false;}\n'
+        '}\n'
+        'function startPullPoll(){\n'
+        '  _pullStart=Date.now();show("pull-poll-status");\n'
+        '  if(!_pullPollTimer)_pullPollTimer=setInterval(doPullPoll,5000);\n'
+        '}\n'
+        'function stopPullPoll(){\n'
+        '  if(_pullPollTimer){clearInterval(_pullPollTimer);_pullPollTimer=null;}\n'
+        '  hide("pull-poll-status");hide("pull-progress");\n'
+        '}\n'
+        'async function doPullPoll(){\n'
+        '  const elapsed=_pullStart?((Date.now()-_pullStart)/1000).toFixed(0)+"s":"?";\n'
+        '  setText("pull-poll-elapsed",elapsed);\n'
+        '  try{\n'
+        '    const r=await fetch(B+"/model/status");const d=await r.json();\n'
+        '    const s=d.state||"unknown";\n'
+        '    badge(document.getElementById("pull-badge"),s,bc(s));\n'
+        '    setText("pull-msg",d.message||"");\n'
+        '    setJson("pull-status-pre",d);show("pull-status-details");\n'
+        '    if(s==="ready"||s==="error"||s==="not_started"){stopPullPoll();}\n'
+        '    if(s==="error"&&d.error){setText("pull-err",d.error);show("pull-err");}\n'
+        '    else{hide("pull-err");}\n'
+        '  }catch(e){/* keep polling */}\n'
+        '}\n'
+        '\n'
+        '// ── 5. POST /generate ───────────────────────────────────────────────\n'
+        'function switchTab(n){\n'
+        '  ["prompt","batch"].forEach(t=>{\n'
+        '    document.getElementById("tab-"+t).classList.toggle("on",t===n);\n'
+        '    document.getElementById("tp-"+t).classList.toggle("on",t===n);\n'
+        '  });\n'
+        '}\n'
+        'document.getElementById("b-file").addEventListener("change",function(){\n'
+        '  const f=this.files[0];if(!f)return;\n'
+        '  const rd=new FileReader();\n'
+        '  rd.onload=e=>{document.getElementById("b-json").value=e.target.result;};\n'
+        '  rd.readAsText(f);\n'
+        '});\n'
+        'let _lastImgs=[];\n'
+        'async function callGenerate(){\n'
+        '  const btn=document.getElementById("btn-gen");\n'
+        '  btn.disabled=true;show("gen-spin");hide("gen-err");hide("gen-resp");hide("btn-dl-all");\n'
+        '  document.getElementById("gen-imgs").innerHTML="";\n'
+        '  _lastImgs=[];\n'
+        '  let body;\n'
+        '  const isPrompt=document.getElementById("tp-prompt").classList.contains("on");\n'
+        '  if(isPrompt){\n'
+        '    const p=document.getElementById("p-prompt").value.trim();\n'
+        '    if(!p){const e=document.getElementById("gen-err");e.textContent="Prompt is required.";e.classList.remove("hidden");btn.disabled=false;hide("gen-spin");return;}\n'
+        '    const po={prompt:p};\n'
+        '    const neg=document.getElementById("p-neg").value.trim();if(neg)po.negative_prompt=neg;\n'
+        '    const seed=document.getElementById("p-seed").value.trim();if(seed)po.seed=parseInt(seed,10);\n'
+        '    body={prompts:[po],steps:parseInt(document.getElementById("p-steps").value,10)||20,guidance:parseFloat(document.getElementById("p-guidance").value)||7.5,width:parseInt(document.getElementById("p-width").value,10)||512,height:parseInt(document.getElementById("p-height").value,10)||512,refine:document.getElementById("p-refine").checked,cpu:document.getElementById("p-cpu").checked};\n'
+        '  }else{\n'
+        '    const raw=document.getElementById("b-json").value.trim();\n'
+        '    if(!raw){const e=document.getElementById("gen-err");e.textContent="Paste or upload a batch JSON file.";e.classList.remove("hidden");btn.disabled=false;hide("gen-spin");return;}\n'
+        '    try{body=JSON.parse(raw);}catch(ex){const e=document.getElementById("gen-err");e.textContent="Invalid JSON: "+ex.message;e.classList.remove("hidden");btn.disabled=false;hide("gen-spin");return;}\n'
+        '  }\n'
+        '  try{\n'
+        '    const r=await fetch(B+"/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});\n'
+        '    const d=await r.json();\n'
+        '    setJson("gen-pre",d);\n'
+        '    const lbl=document.getElementById("gen-resp-label");\n'
+        '    lbl.textContent="JSON response (HTTP "+r.status+(d.device?" \u00b7 "+d.device:"")+")";  \n'
+        '    show("gen-resp");\n'
+        '    if(d.status!=="success"){\n'
+        '      const e=document.getElementById("gen-err");e.textContent="Server error: "+(d.error||JSON.stringify(d));e.classList.remove("hidden");\n'
+        '    }else{\n'
+        '      _lastImgs=d.results||[];\n'
+        '      renderImages(_lastImgs);\n'
+        '      if(_lastImgs.some(x=>x.image_base64))show("btn-dl-all");\n'
+        '    }\n'
+        '  }catch(e){const el=document.getElementById("gen-err");el.textContent="Request failed: "+e;el.classList.remove("hidden");}\n'
+        '  finally{btn.disabled=false;hide("gen-spin");}\n'
+        '}\n'
+        'function renderImages(results){\n'
+        '  const c=document.getElementById("gen-imgs");c.innerHTML="";\n'
+        '  results.forEach((r,i)=>{\n'
+        '    const div=document.createElement("div");div.className="img-card";\n'
+        '    if(r.status==="ok"&&r.image_base64){\n'
+        '      const img=document.createElement("img");\n'
+        '      img.src="data:image/png;base64,"+r.image_base64;\n'
+        '      img.alt=r.prompt||"image "+i;\n'
+        '      div.appendChild(img);\n'
+        '      const meta=document.createElement("div");meta.className="img-meta";\n'
+        '      const p=document.createElement("p");p.title=r.prompt||"";p.textContent=(r.prompt||"").substring(0,72);meta.appendChild(p);\n'
+        '      const a=document.createElement("a");a.className="dl";\n'
+        '      a.href="data:image/png;base64,"+r.image_base64;\n'
+        '      a.download=r.filename||("image-"+i+".png");\n'
+        '      a.textContent="Download "+( r.filename||"image-"+i+".png");meta.appendChild(a);\n'
+        '      div.appendChild(meta);\n'
+        '    }else{\n'
+        '      const meta=document.createElement("div");meta.className="img-meta";\n'
+        '      const eb=document.createElement("div");eb.className="err-box";eb.style.margin="0";\n'
+        '      eb.textContent="Error: "+(r.error||r.status||"unknown");meta.appendChild(eb);\n'
+        '      const p=document.createElement("p");p.textContent=(r.prompt||"").substring(0,72);meta.appendChild(p);\n'
+        '      div.appendChild(meta);\n'
+        '    }\n'
+        '    c.appendChild(div);\n'
+        '  });\n'
+        '}\n'
+        'function downloadAll(){\n'
+        '  _lastImgs.forEach((r,i)=>{\n'
+        '    if(r.status==="ok"&&r.image_base64){\n'
+        '      const a=document.createElement("a");\n'
+        '      a.href="data:image/png;base64,"+r.image_base64;\n'
+        '      a.download=r.filename||("image-"+i+".png");\n'
+        '      document.body.appendChild(a);a.click();document.body.removeChild(a);\n'
+        '    }\n'
+        '  });\n'
+        '}\n'
+        '\n'
+        '// auto-fire health on load\n'
+        'callHealth();\n'
+        'callModelStatus();\n'
+        '</script>\n'
+        '</body>\n'
+        '</html>\n'
+    )
     resp = make_response(html, 200)
     resp.headers["Content-Type"] = "text/html; charset=utf-8"
     return resp
