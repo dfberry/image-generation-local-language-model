@@ -9,7 +9,10 @@ pip install -r requirements.txt
 # 2. Run Flask server
 python app.py
 
-# 3. Test with curl (in another terminal)
+# 3. Open the browser UI
+#    Navigate to: http://localhost:8000/ui
+
+# 4. Or test with curl (in another terminal)
 curl -X POST http://localhost:8000/generate \
   -H "Content-Type: application/json" \
   -d '{
@@ -18,6 +21,25 @@ curl -X POST http://localhost:8000/generate \
 ```
 
 Output appears in `outputs/` directory.
+
+---
+
+## Browser UI (GET /ui)
+
+Open **http://localhost:8000/ui** (or your Azure Container Apps URL + `/ui`) in any browser.
+
+The UI lets you:
+- **Check server health** — see device (CPU/CUDA) and auto-refreshes every 15 s.
+- **Download / warm up the model** — click "Download / Warm Up Model", then watch the status poll until it shows `ready`. The ~7 GB weights are cached on disk; subsequent starts skip the download.
+- **Generate images** — choose "Free-text prompt" (enter a prompt + optional settings) or "Batch JSON" (paste or upload a `batch.json` file). Click **Generate**, wait for the spinner to finish, then view and download the resulting images directly in the browser.
+
+> 💡 For a quick CPU smoke-test use **Steps = 20** and **512 × 512**. A full 1024 × 1024 run with 40 steps can take several minutes on CPU.
+
+---
+
+## CORS — open access
+
+All endpoints return `Access-Control-Allow-Origin: *` so they can be called from any browser origin, the `/ui` page itself, or external scripts — no auth required.
 
 ---
 

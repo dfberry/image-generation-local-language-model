@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
 """
 Flask wrapper for SDXL image generation.
-Exposes /generate POST endpoint accepting JSON batch configs.
+
+Endpoints:
+  GET  /             - API info (JSON)
+  GET  /health       - Health check (no model load)
+  GET  /ui           - Browser UI (HTML, self-contained)
+  POST /generate     - Generate images from a batch config (loads model on first call)
+  POST /model/pull   - Kick off async model download/warm-up; returns 202 immediately
+  GET  /model/status - Poll warm-up state: not_started | in_progress | ready | error
+
+CORS: permissive (Access-Control-Allow-Origin: *) on all routes so the API
+can be called from any browser origin or from the /ui page itself.
 """
 
+import base64
+import gc
 import json
 import logging
 import os
+import threading
 from typing import Any, Optional
 
 import torch
-from flask import Flask, request, jsonify
-from datetime import datetime
+from flask import Flask, request, jsonify, make_response
+from datetime import datetime, timezone
 
-from src.image_generation.generate import generate_with_retry, OOMError, get_device, batch_generate
-from types import SimpleNamespace
+from src.image_generation.generate import run_batch, OOMError, get_device, load_base
 
 
 # Setup logging
@@ -25,6 +37,93 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# CORS — permissive, no auth required, works from any browser/origin
+# ---------------------------------------------------------------------------
+@app.after_request
+def _add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return response
+
+@app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
+@app.route("/<path:path>", methods=["OPTIONS"])
+def _options_preflight(path):
+    resp = make_response("", 204)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return resp
+
+# ---------------------------------------------------------------------------
+# Model warm-up state
+# ---------------------------------------------------------------------------
+_model_state_lock = threading.Lock()
+_model_state: dict = {
+    "state": "not_started",   # not_started | in_progress | ready | error
+    "message": "Model has not been pulled yet.",
+    "started_at": None,
+    "finished_at": None,
+    "elapsed_seconds": None,
+    "error": None,
+}
+
+
+def _pull_worker() -> None:
+    """Background thread: loads the base model to warm the on-disk HF cache."""
+    device = get_device()
+    started = datetime.now(timezone.utc)
+
+    with _model_state_lock:
+        _model_state.update({
+            "state": "in_progress",
+            "message": f"Downloading/loading model on device '{device}'…",
+            "started_at": started.isoformat(),
+            "finished_at": None,
+            "elapsed_seconds": None,
+            "error": None,
+        })
+
+    logger.info("model/pull: starting load_base() to warm HF disk cache")
+
+    try:
+        pipe = load_base(device)
+
+        # Free the in-memory pipeline immediately — the durable win is the
+        # on-disk HF cache. run_batch() will reload from that warm cache when
+        # /generate is called, avoiding the expensive ~7 GB network download.
+        del pipe
+        gc.collect()
+
+        finished = datetime.now(timezone.utc)
+        elapsed = (finished - started).total_seconds()
+        logger.info(f"model/pull: done in {elapsed:.1f}s; in-memory pipeline released")
+
+        with _model_state_lock:
+            _model_state.update({
+                "state": "ready",
+                "message": "Model weights cached on disk. /generate will load from cache.",
+                "finished_at": finished.isoformat(),
+                "elapsed_seconds": elapsed,
+                "error": None,
+            })
+
+    except (OOMError, Exception) as exc:
+        finished = datetime.now(timezone.utc)
+        elapsed = (finished - started).total_seconds()
+        msg = str(exc)
+        logger.error(f"model/pull: failed after {elapsed:.1f}s — {msg}", exc_info=True)
+
+        with _model_state_lock:
+            _model_state.update({
+                "state": "error",
+                "message": "Model pull failed. See 'error' field.",
+                "finished_at": finished.isoformat(),
+                "elapsed_seconds": elapsed,
+                "error": msg,
+            })
 
 
 def validate_batch_config(config: dict) -> Optional[str]:
@@ -68,7 +167,7 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "device": device,
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }), 200
 
 
@@ -76,20 +175,38 @@ def health_check():
 def generate_endpoint():
     """
     POST /generate
-    
-    Request JSON:
+
+    Accepts two request shapes:
+
+    Flat form — settings at root level:
     {
-        "prompts": [
-            {"prompt": "a tropical sunset", "seed": 42, "output": "sunset.png"},
-            {"prompt": "underwater scene", "seed": 43}
-        ],
+        "prompts": [...],
         "steps": 40,
         "guidance": 7.5,
         "width": 1024,
         "height": 1024,
-        "refine": false
+        "refine": false,
+        "cpu": false
     }
-    
+
+    Object form — globals nested under a "settings" key (CLI batch.json verbatim).
+    An optional top-level "description" field is ignored. Root-level keys always
+    override matching keys inside "settings":
+    {
+        "description": "optional, ignored",
+        "settings": {
+            "steps": 30,
+            "guidance": 9.0,
+            "width": 768,
+            "height": 768,
+            "refine": true,
+            "cpu": false
+        },
+        "prompts": [...]
+    }
+
+    Resolution precedence: explicit root value > nested settings value > built-in default.
+
     Response JSON:
     {
         "status": "success",
@@ -97,9 +214,12 @@ def generate_endpoint():
         "results": [
             {
                 "prompt": "a tropical sunset",
-                "output": "/path/to/sunset.png",
+                "output": "/app/outputs/sunset.png",
                 "status": "ok",
-                "error": null
+                "error": null,
+                "filename": "sunset.png",
+                "content_type": "image/png",
+                "image_base64": "iVBORw0KGgo...=="
             }
         ],
         "timestamp": "2026-07-03T09:23:14Z"
@@ -112,7 +232,7 @@ def generate_endpoint():
             return jsonify({
                 "status": "error",
                 "error": "Request body must be valid JSON",
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }), 400
         
         # Validate structure
@@ -121,120 +241,106 @@ def generate_endpoint():
             return jsonify({
                 "status": "error",
                 "error": validation_error,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }), 400
         
-        # Extract parameters with defaults
+        # Support object-form: globals nested under "settings" (CLI batch.json).
+        # Root-level keys always win over nested settings values.
+        settings = config["settings"] if isinstance(config.get("settings"), dict) else {}
+
+        def _resolve(key, default):
+            if key in config:
+                return config[key]
+            if key in settings:
+                return settings[key]
+            return default
+
+        # Extract parameters with defaults (root > settings > default)
         prompts = config.get("prompts", [])
-        steps = int(config.get("steps", 40))
-        guidance = float(config.get("guidance", 7.5))
-        width = int(config.get("width", 1024))
-        height = int(config.get("height", 1024))
-        refine = config.get("refine", False)
-        use_cpu = config.get("cpu", False)
+        steps = int(_resolve("steps", 40))
+        guidance = float(_resolve("guidance", 7.5))
+        width = int(_resolve("width", 1024))
+        height = int(_resolve("height", 1024))
+        refine = _resolve("refine", False)
+        use_cpu = _resolve("cpu", False)
         
         # Validate numeric ranges
         if steps < 1 or steps > 150:
             return jsonify({
                 "status": "error",
                 "error": "'steps' must be between 1 and 150",
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }), 400
         
         if guidance < 0 or guidance > 50:
             return jsonify({
                 "status": "error",
                 "error": "'guidance' must be between 0 and 50",
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }), 400
         
         if width not in (512, 768, 1024):
             return jsonify({
                 "status": "error",
                 "error": "'width' must be 512, 768, or 1024",
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }), 400
         
         if height not in (512, 768, 1024):
             return jsonify({
                 "status": "error",
                 "error": "'height' must be 512, 768, or 1024",
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }), 400
         
         device = "cpu" if use_cpu else get_device(use_cpu)
         logger.info(f"Generating {len(prompts)} images on device: {device}")
-        
-        # Convert prompts to expected format
-        generation_inputs = []
+
+        # Build per-item list in the reference batch format
+        batch_items = []
         for p_obj in prompts:
-            prompt_text = p_obj["prompt"]
-            output_path = p_obj.get("output")
-            if output_path is None:
-                os.makedirs("outputs", exist_ok=True)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                output_path = f"outputs/image_{timestamp}.png"
-            
-            generation_inputs.append({
-                "prompt": prompt_text,
-                "output": output_path,
+            batch_items.append({
+                "prompt": p_obj["prompt"],
+                "output": p_obj.get("output"),
                 "seed": p_obj.get("seed"),
-                "steps": steps,
-                "guidance": guidance,
-                "width": width,
-                "height": height,
-                "refine": refine,
-                "cpu": use_cpu
+                "negative_prompt": p_obj.get("negative_prompt"),
             })
-        
-        # Generate images
-        results = []
-        for gen_input in generation_inputs:
-            args = SimpleNamespace(
-                prompt=gen_input["prompt"],
-                output=gen_input["output"],
-                seed=gen_input.get("seed"),
-                steps=gen_input.get("steps", steps),
-                guidance=gen_input.get("guidance", guidance),
-                width=gen_input.get("width", width),
-                height=gen_input.get("height", height),
-                refine=gen_input.get("refine", refine),
-                cpu=gen_input.get("cpu", use_cpu)
-            )
-            
-            try:
-                output_path = generate_with_retry(args, max_retries=2)
-                results.append({
-                    "prompt": gen_input["prompt"],
-                    "output": output_path,
-                    "status": "ok",
-                    "error": None
-                })
-                logger.info(f"✅ Generated: {output_path}")
-            except OOMError as e:
-                error_msg = str(e)
-                results.append({
-                    "prompt": gen_input["prompt"],
-                    "output": None,
-                    "status": "oom_error",
-                    "error": error_msg
-                })
-                logger.error(f"❌ OOM Error: {error_msg}")
-            except Exception as e:
-                error_msg = str(e)
-                results.append({
-                    "prompt": gen_input["prompt"],
-                    "output": None,
-                    "status": "error",
-                    "error": error_msg
-                })
-                logger.error(f"❌ Generation failed: {error_msg}")
-        
+
+        results = run_batch(
+            batch_items,
+            steps=steps,
+            guidance=guidance,
+            width=width,
+            height=height,
+            refine=refine,
+            cpu=use_cpu,
+        )
+        for r in results:
+            if r["status"] == "ok":
+                logger.info(f"✅ Generated: {r['output']}")
+            else:
+                logger.error(f"❌ {r['status']}: {r['error']}")
+
+        # Enrich ok results with base64 image bytes for ephemeral cloud filesystems
+        for r in results:
+            if r["status"] == "ok" and r.get("output") and os.path.isfile(r["output"]):
+                try:
+                    with open(r["output"], "rb") as f:
+                        r["image_base64"] = base64.b64encode(f.read()).decode("utf-8")
+                    r["filename"] = os.path.basename(r["output"])
+                    r["content_type"] = "image/png"
+                except Exception as read_err:
+                    r["image_base64"] = None
+                    existing_error = r.get("error") or ""
+                    r["error"] = f"{existing_error}; read error: {read_err}".lstrip("; ")
+            else:
+                r["image_base64"] = None
+
         return jsonify({
             "status": "success",
             "device": device,
             "results": results,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }), 200
     
     except ValueError as e:
@@ -242,15 +348,530 @@ def generate_endpoint():
         return jsonify({
             "status": "error",
             "error": f"Invalid parameter: {str(e)}",
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }), 400
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
         return jsonify({
             "status": "error",
             "error": f"Internal server error: {str(e)}",
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }), 500
+
+
+@app.route("/model/pull", methods=["POST"])
+def model_pull():
+    """
+    POST /model/pull
+
+    Starts a one-time background download of the SDXL base model into the
+    HF disk cache. Returns 202 immediately; poll GET /model/status for progress.
+
+    Optional JSON body: {"force": true} — re-pull even if state is already "ready".
+
+    Response:
+        { "state": "in_progress"|"ready"|"error"|"not_started",
+          "message": "...", "timestamp": "..." }
+    """
+    body = request.get_json(silent=True) or {}
+    force = bool(body.get("force", False))
+
+    with _model_state_lock:
+        current_state = _model_state["state"]
+
+        if current_state == "in_progress":
+            return jsonify({
+                "state": "in_progress",
+                "message": "Pull already in progress.",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }), 202
+
+        if current_state == "ready" and not force:
+            return jsonify({
+                "state": "ready",
+                "message": "Model is already cached. Pass {\"force\": true} to re-pull.",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }), 200
+
+        # Transition to in_progress synchronously (inside the lock) so a
+        # concurrent caller sees the right state before the thread starts.
+        _model_state.update({
+            "state": "in_progress",
+            "message": "Pull started.",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "elapsed_seconds": None,
+            "error": None,
+        })
+
+    thread = threading.Thread(target=_pull_worker, daemon=True, name="model-pull")
+    thread.start()
+    logger.info("model/pull: background thread launched")
+
+    return jsonify({
+        "state": "in_progress",
+        "message": "Model pull started in background. Poll GET /model/status.",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }), 202
+
+
+@app.route("/model/status", methods=["GET"])
+def model_status():
+    """
+    GET /model/status
+
+    Returns the current model warm-up state.
+
+    Response (always HTTP 200):
+        { "state": "not_started"|"in_progress"|"ready"|"error",
+          "message": "...",
+          "started_at": "<ISO8601 or null>",
+          "finished_at": "<ISO8601 or null>",
+          "elapsed_seconds": <number or null>,
+          "error": "<string or null>",
+          "device": "cuda|mps|cpu",
+          "timestamp": "<ISO8601>" }
+    """
+    with _model_state_lock:
+        snapshot = dict(_model_state)
+
+    snapshot["device"] = get_device()
+    snapshot["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+    # Only include "error" key when state is error
+    if snapshot["state"] != "error":
+        snapshot.pop("error", None)
+
+    return jsonify(snapshot), 200
+
+
+@app.route("/ui", methods=["GET"])
+def browser_ui():
+    """Serve a self-contained browser console — one section per endpoint."""
+    html = (
+        '<!DOCTYPE html>\n'
+        '<html lang="en">\n'
+        '<head>\n'
+        '<meta charset="UTF-8">\n'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">\n'
+        '<title>SDXL API Console</title>\n'
+        '<style>\n'
+        '*{box-sizing:border-box;margin:0;padding:0}\n'
+        'body{font-family:system-ui,sans-serif;background:#0f0f13;color:#e2e2e6;padding:1.5rem 1.5rem 3rem}\n'
+        'h1{font-size:1.5rem;font-weight:700;color:#a78bfa;margin-bottom:.4rem}\n'
+        '.subtitle{font-size:.8rem;color:#52525b;margin-bottom:1.5rem}\n'
+        '.card{background:#1a1a24;border:1px solid #2d2d40;border-radius:10px;padding:1.25rem;margin-bottom:1.25rem}\n'
+        '.card-header{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;margin-bottom:.9rem}\n'
+        '.method{font-size:.7rem;font-weight:700;padding:.2rem .5rem;border-radius:4px;text-transform:uppercase;letter-spacing:.05em}\n'
+        '.get{background:#14532d;color:#4ade80}.post{background:#1e3a5f;color:#60a5fa}\n'
+        '.path{font-family:monospace;font-size:.9rem;color:#e2e2e6;font-weight:600}\n'
+        '.desc{font-size:.78rem;color:#71717a;flex:1}\n'
+        '.controls{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-bottom:.75rem}\n'
+        'button{background:#7c3aed;color:#fff;border:none;border-radius:6px;padding:.4rem .85rem;font-size:.82rem;cursor:pointer;font-weight:600;transition:background .15s}\n'
+        'button:hover{background:#6d28d9}\n'
+        'button:disabled{background:#3f3f46;color:#71717a;cursor:not-allowed}\n'
+        'button.sec{background:#27272a;color:#e2e2e6}\n'
+        'button.sec:hover{background:#3f3f46}\n'
+        '.toggle-label{font-size:.78rem;color:#a1a1aa;display:flex;align-items:center;gap:.35rem;cursor:pointer;user-select:none}\n'
+        '.toggle-label input{width:auto;cursor:pointer}\n'
+        '.field{margin-bottom:.65rem}\n'
+        'label{display:block;font-size:.78rem;font-weight:500;color:#a1a1aa;margin-bottom:.2rem}\n'
+        'input[type=text],input[type=number],select,textarea{width:100%;background:#0f0f13;border:1px solid #3f3f46;border-radius:6px;color:#e2e2e6;padding:.38rem .6rem;font-size:.83rem;font-family:inherit}\n'
+        'input:focus,select:focus,textarea:focus{outline:none;border-color:#7c3aed}\n'
+        'textarea{resize:vertical;min-height:110px}\n'
+        '.grid2{display:grid;grid-template-columns:1fr 1fr;gap:.65rem}\n'
+        '.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:.65rem}\n'
+        '.cbrow{display:flex;align-items:center;gap:.4rem;font-size:.82rem;color:#a1a1aa}\n'
+        '.cbrow input{width:auto}\n'
+        '.spinner{display:inline-block;width:14px;height:14px;border:2px solid #7c3aed;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:.3rem}\n'
+        '@keyframes spin{to{transform:rotate(360deg)}}\n'
+        '.hidden{display:none}\n'
+        '.badge{display:inline-block;padding:.15rem .55rem;border-radius:20px;font-size:.72rem;font-weight:700;text-transform:uppercase}\n'
+        '.ok{background:#14532d;color:#4ade80}.info{background:#1e3a5f;color:#60a5fa}\n'
+        '.err{background:#450a0a;color:#f87171}.grey{background:#27272a;color:#a1a1aa}\n'
+        '.warn{background:#713f12;color:#fbbf24}\n'
+        '.response-wrap{margin-top:.75rem}\n'
+        'details{border:1px solid #2d2d40;border-radius:6px;overflow:hidden}\n'
+        'summary{padding:.4rem .7rem;font-size:.78rem;font-weight:600;color:#94a3b8;cursor:pointer;background:#111118;list-style:none;display:flex;align-items:center;gap:.5rem}\n'
+        'summary::-webkit-details-marker{display:none}\n'
+        'summary::before{content:"\\25B6";font-size:.6rem;transition:transform .15s}\n'
+        'details[open] summary::before{transform:rotate(90deg)}\n'
+        'pre{background:#0a0a0f;color:#a5f3fc;font-size:.75rem;padding:.75rem;overflow-x:auto;max-height:320px;white-space:pre-wrap;word-break:break-all}\n'
+        '.status-row{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;font-size:.83rem;margin-bottom:.3rem}\n'
+        '.elapsed{font-size:.72rem;color:#71717a}\n'
+        '.err-box{background:#450a0a;border:1px solid #7f1d1d;border-radius:6px;padding:.6rem;font-size:.82rem;color:#fca5a5;margin-top:.4rem}\n'
+        '.progress{width:100%;height:3px;background:#27272a;border-radius:2px;margin-top:.5rem}\n'
+        '.progress-fill{height:100%;background:#7c3aed;border-radius:2px;animation:pulse-width 2s ease-in-out infinite}\n'
+        '@keyframes pulse-width{0%{width:15%}50%{width:75%}100%{width:15%}}\n'
+        '.tabs{display:flex;border-bottom:1px solid #2d2d40;margin-bottom:.75rem}\n'
+        '.tab{padding:.4rem .9rem;cursor:pointer;font-size:.82rem;font-weight:500;color:#71717a;border-bottom:2px solid transparent;margin-bottom:-1px}\n'
+        '.tab.on{color:#a78bfa;border-bottom-color:#a78bfa}\n'
+        '.tp{display:none}.tp.on{display:block}\n'
+        '.img-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:.9rem;margin-top:.9rem}\n'
+        '.img-card{background:#111118;border:1px solid #2d2d40;border-radius:8px;overflow:hidden}\n'
+        '.img-card img{width:100%;display:block}\n'
+        '.img-meta{padding:.55rem;display:flex;flex-direction:column;gap:.3rem}\n'
+        '.img-meta p{font-size:.72rem;color:#71717a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n'
+        'a.dl{display:inline-block;padding:.25rem .55rem;background:#27272a;color:#a78bfa;border-radius:4px;font-size:.72rem;text-decoration:none;font-weight:600}\n'
+        'a.dl:hover{background:#3f3f46}\n'
+        '.hint{font-size:.72rem;color:#52525b;margin-top:.2rem}\n'
+        'hr{border:none;border-top:1px solid #1f1f2e;margin:.3rem 0 .7rem}\n'
+        '</style>\n'
+        '</head>\n'
+        '<body>\n'
+        '<h1>SDXL API Console</h1>\n'
+        '<p class="subtitle">One section per endpoint. Every call shows the raw JSON response.</p>\n'
+        '\n'
+        '<!-- 1. GET / -->\n'
+        '<div class="card">\n'
+        '  <div class="card-header">\n'
+        '    <span class="method get">GET</span><span class="path">/</span>\n'
+        '    <span class="desc">API info &amp; endpoint listing</span>\n'
+        '  </div>\n'
+        '  <div class="controls">\n'
+        '    <button onclick="callRoot()">Get API info</button>\n'
+        '    <span id="root-spin" class="hidden"><span class="spinner"></span></span>\n'
+        '  </div>\n'
+        '  <div id="root-resp" class="response-wrap hidden">\n'
+        '    <details open><summary>JSON response</summary><pre id="root-pre"></pre></details>\n'
+        '  </div>\n'
+        '</div>\n'
+        '\n'
+        '<!-- 2. GET /health -->\n'
+        '<div class="card">\n'
+        '  <div class="card-header">\n'
+        '    <span class="method get">GET</span><span class="path">/health</span>\n'
+        '    <span class="desc">Server health &amp; device</span>\n'
+        '  </div>\n'
+        '  <div class="controls">\n'
+        '    <button onclick="callHealth()">Check health</button>\n'
+        '    <span id="health-spin" class="hidden"><span class="spinner"></span></span>\n'
+        '    <label class="toggle-label"><input type="checkbox" id="health-auto" onchange="toggleHealthPoll()"> auto-poll every 10 s</label>\n'
+        '  </div>\n'
+        '  <div id="health-result" class="hidden">\n'
+        '    <div class="status-row">\n'
+        '      <span class="badge grey" id="health-badge">—</span>\n'
+        '      <span id="health-device" style="font-size:.82rem;color:#94a3b8"></span>\n'
+        '      <span class="elapsed" id="health-ts"></span>\n'
+        '    </div>\n'
+        '    <details><summary>JSON response</summary><pre id="health-pre"></pre></details>\n'
+        '  </div>\n'
+        '</div>\n'
+        '\n'
+        '<!-- 3. GET /model/status -->\n'
+        '<div class="card">\n'
+        '  <div class="card-header">\n'
+        '    <span class="method get">GET</span><span class="path">/model/status</span>\n'
+        '    <span class="desc">Current model warm-up state</span>\n'
+        '  </div>\n'
+        '  <div class="controls">\n'
+        '    <button onclick="callModelStatus()">Check model status</button>\n'
+        '    <span id="mstatus-spin" class="hidden"><span class="spinner"></span></span>\n'
+        '    <label class="toggle-label"><input type="checkbox" id="mstatus-auto" onchange="toggleMStatusPoll()"> auto-poll every 5 s</label>\n'
+        '  </div>\n'
+        '  <div id="mstatus-result" class="hidden">\n'
+        '    <div class="status-row">\n'
+        '      <span class="badge grey" id="mstatus-badge">—</span>\n'
+        '      <span id="mstatus-msg" style="font-size:.82rem;color:#94a3b8"></span>\n'
+        '      <span class="elapsed" id="mstatus-elapsed"></span>\n'
+        '    </div>\n'
+        '    <div id="mstatus-err" class="err-box hidden"></div>\n'
+        '    <details><summary>JSON response</summary><pre id="mstatus-pre"></pre></details>\n'
+        '  </div>\n'
+        '</div>\n'
+        '\n'
+        '<!-- 4. POST /model/pull -->\n'
+        '<div class="card">\n'
+        '  <div class="card-header">\n'
+        '    <span class="method post">POST</span><span class="path">/model/pull</span>\n'
+        '    <span class="desc">Start async model download &amp; warm-up (returns 202)</span>\n'
+        '  </div>\n'
+        '  <div class="field">\n'
+        '    <label class="cbrow"><input type="checkbox" id="pull-force"> <span>force re-pull even if already ready</span></label>\n'
+        '  </div>\n'
+        '  <div class="controls">\n'
+        '    <button onclick="callModelPull()" id="btn-pull">Pull / warm up model</button>\n'
+        '    <span id="pull-spin" class="hidden"><span class="spinner"></span>Working…</span>\n'
+        '  </div>\n'
+        '  <div id="pull-result" class="hidden">\n'
+        '    <div class="status-row">\n'
+        '      <span class="badge grey" id="pull-badge">—</span>\n'
+        '      <span id="pull-msg" style="font-size:.82rem;color:#94a3b8"></span>\n'
+        '    </div>\n'
+        '    <div id="pull-progress" class="progress hidden"><div class="progress-fill"></div></div>\n'
+        '    <div id="pull-poll-status" class="status-row hidden" style="margin-top:.5rem">\n'
+        '      <span class="spinner"></span>\n'
+        '      <span style="font-size:.78rem;color:#71717a">Polling /model/status…</span>\n'
+        '      <span class="elapsed" id="pull-poll-elapsed"></span>\n'
+        '    </div>\n'
+        '    <div id="pull-err" class="err-box hidden"></div>\n'
+        '    <details><summary>JSON response (pull)</summary><pre id="pull-pre"></pre></details>\n'
+        '    <details id="pull-status-details" class="hidden" style="margin-top:.4rem"><summary>JSON response (latest status poll)</summary><pre id="pull-status-pre"></pre></details>\n'
+        '  </div>\n'
+        '</div>\n'
+        '\n'
+        '<!-- 5. POST /generate -->\n'
+        '<div class="card">\n'
+        '  <div class="card-header">\n'
+        '    <span class="method post">POST</span><span class="path">/generate</span>\n'
+        '    <span class="desc">Generate images from prompts</span>\n'
+        '  </div>\n'
+        '  <p class="hint" style="margin-bottom:.75rem">Tip: Steps=20, 512x512 for a fast CPU smoke-test. Generation can take several minutes on CPU.</p>\n'
+        '\n'
+        '  <div class="tabs">\n'
+        '    <div class="tab on" id="tab-prompt" onclick="switchTab(\'prompt\')">Free-text prompt</div>\n'
+        '    <div class="tab" id="tab-batch" onclick="switchTab(\'batch\')">Batch JSON</div>\n'
+        '  </div>\n'
+        '\n'
+        '  <div class="tp on" id="tp-prompt">\n'
+        '    <div class="field"><label>Prompt *</label><input type="text" id="p-prompt" placeholder="a serene mountain lake at sunrise, photorealistic"></div>\n'
+        '    <div class="field"><label>Negative prompt</label><input type="text" id="p-neg" placeholder="blur, noise, cartoon"></div>\n'
+        '    <div class="grid3" style="margin-bottom:.65rem">\n'
+        '      <div class="field"><label>Steps (1-150)</label><input type="number" id="p-steps" value="20" min="1" max="150"></div>\n'
+        '      <div class="field"><label>Guidance (0-50)</label><input type="number" id="p-guidance" value="7.5" min="0" max="50" step="0.5"></div>\n'
+        '      <div class="field"><label>Seed (blank=random)</label><input type="number" id="p-seed" placeholder="42"></div>\n'
+        '    </div>\n'
+        '    <div class="grid2" style="margin-bottom:.65rem">\n'
+        '      <div class="field"><label>Width</label><select id="p-width"><option value="512" selected>512</option><option value="768">768</option><option value="1024">1024</option></select></div>\n'
+        '      <div class="field"><label>Height</label><select id="p-height"><option value="512" selected>512</option><option value="768">768</option><option value="1024">1024</option></select></div>\n'
+        '    </div>\n'
+        '    <div style="display:flex;gap:1.2rem;flex-wrap:wrap;margin-bottom:.5rem">\n'
+        '      <label class="cbrow"><input type="checkbox" id="p-refine"> Use refiner</label>\n'
+        '      <label class="cbrow"><input type="checkbox" id="p-cpu" checked> Force CPU</label>\n'
+        '    </div>\n'
+        '  </div>\n'
+        '\n'
+        '  <div class="tp" id="tp-batch">\n'
+        '    <div class="field">\n'
+        '      <label>Upload batch JSON file</label>\n'
+        '      <input type="file" id="b-file" accept=".json,application/json" style="background:transparent;border:none;padding:0;color:#94a3b8">\n'
+        '    </div>\n'
+        '    <div class="field">\n'
+        '      <label>Or paste / edit batch JSON</label>\n'
+        '      <textarea id="b-json" placeholder=\'{"prompts":[{"prompt":"a tropical sunset","seed":42}],"steps":20,"width":512,"height":512}\'></textarea>\n'
+        '      <p class="hint">Shape: {"prompts":[{"prompt":"...","seed":42}],"steps":20,"width":512,"height":512}</p>\n'
+        '    </div>\n'
+        '  </div>\n'
+        '\n'
+        '  <div class="controls" style="margin-top:.5rem">\n'
+        '    <button onclick="callGenerate()" id="btn-gen">Generate</button>\n'
+        '    <span id="gen-spin" class="hidden"><span class="spinner"></span>Generating… (may take minutes on CPU)</span>\n'
+        '    <button class="sec hidden" id="btn-dl-all" onclick="downloadAll()">Download all images</button>\n'
+        '  </div>\n'
+        '  <div id="gen-err" class="err-box hidden"></div>\n'
+        '\n'
+        '  <div id="gen-resp" class="response-wrap hidden">\n'
+        '    <details><summary id="gen-resp-label">JSON response</summary><pre id="gen-pre"></pre></details>\n'
+        '  </div>\n'
+        '  <div id="gen-imgs" class="img-grid"></div>\n'
+        '</div>\n'
+        '\n'
+        '<script>\n'
+        'const B="";\n'
+        '\n'
+        '// helpers\n'
+        'function bc(s){if(s==="healthy"||s==="ready"||s==="ok")return"ok";if(s==="in_progress")return"info";if(s==="error")return"err";if(s==="not_started")return"grey";return"warn";}\n'
+        'function badge(el,txt,cls){el.textContent=txt;el.className="badge "+cls;}\n'
+        'function show(id){document.getElementById(id).classList.remove("hidden");}\n'
+        'function hide(id){document.getElementById(id).classList.add("hidden");}\n'
+        'function setText(id,t){document.getElementById(id).textContent=t;}\n'
+        'function setJson(id,obj){\n'
+        '  // strip image_base64 from display to keep pre readable\n'
+        '  const clone=JSON.parse(JSON.stringify(obj));\n'
+        '  if(clone.results)clone.results=clone.results.map(r=>{const c={...r};if(c.image_base64)c.image_base64="<base64 omitted>";return c;});\n'
+        '  document.getElementById(id).textContent=JSON.stringify(clone,null,2);\n'
+        '}\n'
+        '\n'
+        '// ── 1. GET / ────────────────────────────────────────────────────────\n'
+        'async function callRoot(){\n'
+        '  show("root-spin");hide("root-resp");\n'
+        '  try{\n'
+        '    const r=await fetch(B+"/");const d=await r.json();\n'
+        '    setJson("root-pre",d);show("root-resp");\n'
+        '  }catch(e){alert("Error: "+e);}\n'
+        '  finally{hide("root-spin");}\n'
+        '}\n'
+        '\n'
+        '// ── 2. GET /health ──────────────────────────────────────────────────\n'
+        'let _hTimer=null;\n'
+        'async function callHealth(){\n'
+        '  show("health-spin");\n'
+        '  try{\n'
+        '    const r=await fetch(B+"/health");const d=await r.json();\n'
+        '    badge(document.getElementById("health-badge"),d.status||"?",bc(d.status));\n'
+        '    setText("health-device",d.device?"device: "+d.device:"");\n'
+        '    setText("health-ts",d.timestamp?new Date(d.timestamp).toLocaleTimeString():"");\n'
+        '    setJson("health-pre",d);show("health-result");\n'
+        '  }catch(e){\n'
+        '    badge(document.getElementById("health-badge"),"unreachable","err");\n'
+        '    setText("health-device","");setText("health-ts","");\n'
+        '  }finally{hide("health-spin");}\n'
+        '}\n'
+        'function toggleHealthPoll(){\n'
+        '  if(document.getElementById("health-auto").checked){\n'
+        '    callHealth();_hTimer=setInterval(callHealth,10000);\n'
+        '  }else{clearInterval(_hTimer);_hTimer=null;}\n'
+        '}\n'
+        '\n'
+        '// ── 3. GET /model/status ────────────────────────────────────────────\n'
+        'let _msTimer=null;\n'
+        'async function callModelStatus(){\n'
+        '  show("mstatus-spin");\n'
+        '  try{\n'
+        '    const r=await fetch(B+"/model/status");const d=await r.json();\n'
+        '    const s=d.state||"unknown";\n'
+        '    badge(document.getElementById("mstatus-badge"),s,bc(s));\n'
+        '    setText("mstatus-msg",d.message||"");\n'
+        '    setText("mstatus-elapsed",d.elapsed_seconds!=null?"elapsed: "+d.elapsed_seconds.toFixed(1)+"s":"");\n'
+        '    if(s==="error"&&d.error){setText("mstatus-err",d.error);show("mstatus-err");}else{hide("mstatus-err");}\n'
+        '    setJson("mstatus-pre",d);show("mstatus-result");\n'
+        '  }catch(e){setText("mstatus-msg","fetch error: "+e);}finally{hide("mstatus-spin");}\n'
+        '}\n'
+        'function toggleMStatusPoll(){\n'
+        '  if(document.getElementById("mstatus-auto").checked){\n'
+        '    callModelStatus();_msTimer=setInterval(callModelStatus,5000);\n'
+        '  }else{clearInterval(_msTimer);_msTimer=null;}\n'
+        '}\n'
+        '\n'
+        '// ── 4. POST /model/pull ─────────────────────────────────────────────\n'
+        'let _pullPollTimer=null;\n'
+        'let _pullStart=null;\n'
+        'async function callModelPull(){\n'
+        '  const force=document.getElementById("pull-force").checked;\n'
+        '  document.getElementById("btn-pull").disabled=true;\n'
+        '  show("pull-spin");hide("pull-err");hide("pull-status-details");\n'
+        '  show("pull-result");\n'
+        '  try{\n'
+        '    const r=await fetch(B+"/model/pull",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({force:force})});\n'
+        '    const d=await r.json();\n'
+        '    setJson("pull-pre",d);\n'
+        '    badge(document.getElementById("pull-badge"),d.state||"?",bc(d.state));\n'
+        '    setText("pull-msg",d.message||"");\n'
+        '    if(d.state==="in_progress"){show("pull-progress");startPullPoll();}else{hide("pull-progress");}\n'
+        '    if(d.state==="error"&&d.error){setText("pull-err",d.error);show("pull-err");}\n'
+        '  }catch(e){setText("pull-err","Request failed: "+e);show("pull-err");}\n'
+        '  finally{hide("pull-spin");document.getElementById("btn-pull").disabled=false;}\n'
+        '}\n'
+        'function startPullPoll(){\n'
+        '  _pullStart=Date.now();show("pull-poll-status");\n'
+        '  if(!_pullPollTimer)_pullPollTimer=setInterval(doPullPoll,5000);\n'
+        '}\n'
+        'function stopPullPoll(){\n'
+        '  if(_pullPollTimer){clearInterval(_pullPollTimer);_pullPollTimer=null;}\n'
+        '  hide("pull-poll-status");hide("pull-progress");\n'
+        '}\n'
+        'async function doPullPoll(){\n'
+        '  const elapsed=_pullStart?((Date.now()-_pullStart)/1000).toFixed(0)+"s":"?";\n'
+        '  setText("pull-poll-elapsed",elapsed);\n'
+        '  try{\n'
+        '    const r=await fetch(B+"/model/status");const d=await r.json();\n'
+        '    const s=d.state||"unknown";\n'
+        '    badge(document.getElementById("pull-badge"),s,bc(s));\n'
+        '    setText("pull-msg",d.message||"");\n'
+        '    setJson("pull-status-pre",d);show("pull-status-details");\n'
+        '    if(s==="ready"||s==="error"||s==="not_started"){stopPullPoll();}\n'
+        '    if(s==="error"&&d.error){setText("pull-err",d.error);show("pull-err");}\n'
+        '    else{hide("pull-err");}\n'
+        '  }catch(e){/* keep polling */}\n'
+        '}\n'
+        '\n'
+        '// ── 5. POST /generate ───────────────────────────────────────────────\n'
+        'function switchTab(n){\n'
+        '  ["prompt","batch"].forEach(t=>{\n'
+        '    document.getElementById("tab-"+t).classList.toggle("on",t===n);\n'
+        '    document.getElementById("tp-"+t).classList.toggle("on",t===n);\n'
+        '  });\n'
+        '}\n'
+        'document.getElementById("b-file").addEventListener("change",function(){\n'
+        '  const f=this.files[0];if(!f)return;\n'
+        '  const rd=new FileReader();\n'
+        '  rd.onload=e=>{document.getElementById("b-json").value=e.target.result;};\n'
+        '  rd.readAsText(f);\n'
+        '});\n'
+        'let _lastImgs=[];\n'
+        'async function callGenerate(){\n'
+        '  const btn=document.getElementById("btn-gen");\n'
+        '  btn.disabled=true;show("gen-spin");hide("gen-err");hide("gen-resp");hide("btn-dl-all");\n'
+        '  document.getElementById("gen-imgs").innerHTML="";\n'
+        '  _lastImgs=[];\n'
+        '  let body;\n'
+        '  const isPrompt=document.getElementById("tp-prompt").classList.contains("on");\n'
+        '  if(isPrompt){\n'
+        '    const p=document.getElementById("p-prompt").value.trim();\n'
+        '    if(!p){const e=document.getElementById("gen-err");e.textContent="Prompt is required.";e.classList.remove("hidden");btn.disabled=false;hide("gen-spin");return;}\n'
+        '    const po={prompt:p};\n'
+        '    const neg=document.getElementById("p-neg").value.trim();if(neg)po.negative_prompt=neg;\n'
+        '    const seed=document.getElementById("p-seed").value.trim();if(seed)po.seed=parseInt(seed,10);\n'
+        '    body={prompts:[po],steps:parseInt(document.getElementById("p-steps").value,10)||20,guidance:parseFloat(document.getElementById("p-guidance").value)||7.5,width:parseInt(document.getElementById("p-width").value,10)||512,height:parseInt(document.getElementById("p-height").value,10)||512,refine:document.getElementById("p-refine").checked,cpu:document.getElementById("p-cpu").checked};\n'
+        '  }else{\n'
+        '    const raw=document.getElementById("b-json").value.trim();\n'
+        '    if(!raw){const e=document.getElementById("gen-err");e.textContent="Paste or upload a batch JSON file.";e.classList.remove("hidden");btn.disabled=false;hide("gen-spin");return;}\n'
+        '    try{body=JSON.parse(raw);}catch(ex){const e=document.getElementById("gen-err");e.textContent="Invalid JSON: "+ex.message;e.classList.remove("hidden");btn.disabled=false;hide("gen-spin");return;}\n'
+        '  }\n'
+        '  try{\n'
+        '    const r=await fetch(B+"/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});\n'
+        '    const d=await r.json();\n'
+        '    setJson("gen-pre",d);\n'
+        '    const lbl=document.getElementById("gen-resp-label");\n'
+        '    lbl.textContent="JSON response (HTTP "+r.status+(d.device?" \u00b7 "+d.device:"")+")";  \n'
+        '    show("gen-resp");\n'
+        '    if(d.status!=="success"){\n'
+        '      const e=document.getElementById("gen-err");e.textContent="Server error: "+(d.error||JSON.stringify(d));e.classList.remove("hidden");\n'
+        '    }else{\n'
+        '      _lastImgs=d.results||[];\n'
+        '      renderImages(_lastImgs);\n'
+        '      if(_lastImgs.some(x=>x.image_base64))show("btn-dl-all");\n'
+        '    }\n'
+        '  }catch(e){const el=document.getElementById("gen-err");el.textContent="Request failed: "+e;el.classList.remove("hidden");}\n'
+        '  finally{btn.disabled=false;hide("gen-spin");}\n'
+        '}\n'
+        'function renderImages(results){\n'
+        '  const c=document.getElementById("gen-imgs");c.innerHTML="";\n'
+        '  results.forEach((r,i)=>{\n'
+        '    const div=document.createElement("div");div.className="img-card";\n'
+        '    if(r.status==="ok"&&r.image_base64){\n'
+        '      const img=document.createElement("img");\n'
+        '      img.src="data:image/png;base64,"+r.image_base64;\n'
+        '      img.alt=r.prompt||"image "+i;\n'
+        '      div.appendChild(img);\n'
+        '      const meta=document.createElement("div");meta.className="img-meta";\n'
+        '      const p=document.createElement("p");p.title=r.prompt||"";p.textContent=(r.prompt||"").substring(0,72);meta.appendChild(p);\n'
+        '      const a=document.createElement("a");a.className="dl";\n'
+        '      a.href="data:image/png;base64,"+r.image_base64;\n'
+        '      a.download=r.filename||("image-"+i+".png");\n'
+        '      a.textContent="Download "+( r.filename||"image-"+i+".png");meta.appendChild(a);\n'
+        '      div.appendChild(meta);\n'
+        '    }else{\n'
+        '      const meta=document.createElement("div");meta.className="img-meta";\n'
+        '      const eb=document.createElement("div");eb.className="err-box";eb.style.margin="0";\n'
+        '      eb.textContent="Error: "+(r.error||r.status||"unknown");meta.appendChild(eb);\n'
+        '      const p=document.createElement("p");p.textContent=(r.prompt||"").substring(0,72);meta.appendChild(p);\n'
+        '      div.appendChild(meta);\n'
+        '    }\n'
+        '    c.appendChild(div);\n'
+        '  });\n'
+        '}\n'
+        'function downloadAll(){\n'
+        '  _lastImgs.forEach((r,i)=>{\n'
+        '    if(r.status==="ok"&&r.image_base64){\n'
+        '      const a=document.createElement("a");\n'
+        '      a.href="data:image/png;base64,"+r.image_base64;\n'
+        '      a.download=r.filename||("image-"+i+".png");\n'
+        '      document.body.appendChild(a);a.click();document.body.removeChild(a);\n'
+        '    }\n'
+        '  });\n'
+        '}\n'
+        '\n'
+        '// auto-fire health on load\n'
+        'callHealth();\n'
+        'callModelStatus();\n'
+        '</script>\n'
+        '</body>\n'
+        '</html>\n'
+    )
+    resp = make_response(html, 200)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    return resp
 
 
 @app.route("/", methods=["GET"])
@@ -262,7 +883,10 @@ def root():
         "endpoints": {
             "GET /": "This message",
             "GET /health": "Health check",
-            "POST /generate": "Generate images from batch config"
+            "GET /ui": "Browser UI — open in your browser to manage and generate images",
+            "POST /generate": "Generate images from batch config",
+            "POST /model/pull": "Start async model download/warm-up (returns 202)",
+            "GET /model/status": "Poll model warm-up state"
         },
         "documentation": "POST /generate with JSON batch config containing 'prompts' array"
     }), 200
@@ -272,3 +896,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"Starting SDXL Generation API on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
+
