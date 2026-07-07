@@ -15,6 +15,21 @@ import sys
 from datetime import datetime
 from types import SimpleNamespace
 
+# ---------------------------------------------------------------------------
+# Azure Files (SMB) does not support POSIX flock(), which huggingface_hub's
+# default FileLock uses to guard concurrent model downloads. When the HF cache
+# lives on an SMB-mounted share (e.g. /root/.cache/huggingface backed by Azure
+# Files in Container Apps), acquiring that lock raises
+# "PermissionError: [Errno 13] Permission denied" and the download aborts.
+# SoftFileLock uses a plain create-a-file lock (no flock syscall), which works
+# on SMB. Patch filelock BEFORE importing diffusers/huggingface_hub so their
+# `from filelock import FileLock` binds to the soft implementation. This is a
+# no-op behavioural change on local filesystems.
+# ---------------------------------------------------------------------------
+import filelock as _filelock
+if hasattr(_filelock, "SoftFileLock"):
+    _filelock.FileLock = _filelock.SoftFileLock
+
 import torch
 from diffusers import DiffusionPipeline
 
