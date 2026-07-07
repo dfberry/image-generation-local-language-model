@@ -24,9 +24,17 @@ hooks:
   # predeploy hook removed: azd builds and pushes the Docker image automatically
   # via the services.api.docker block above. A manual docker build here was
   # redundant and would re-tag with :latest instead of azd's deploy tag.
+  #
+  # postdeploy: after the app is live, land the model on the Azure Files share
+  # by calling the app's async /model/pull and blocking until /model/status is
+  # "ready". This runs at deploy time (not provision) because the app must be
+  # running to populate the share via its SMB-safe download logic. The URL comes
+  # from the `containerAppUrl` infra output, exposed to hooks as an env var.
   postdeploy:
-    shell: sh
     continueOnError: true
-    run: |
-      echo "SDXL API deployed successfully"
-      echo "Service URL: https://${CONTAINER_APP_FQDN}"
+    posix:
+      shell: sh
+      run: ./scripts/pull-model.sh
+    windows:
+      shell: pwsh
+      run: ./scripts/pull-model.ps1
