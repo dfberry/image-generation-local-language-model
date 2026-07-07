@@ -628,9 +628,50 @@ The ACA deployment runs the same Flask HTTP server (`app.py`) you can start loca
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `GET /` | GET | API info / version |
+| `GET /` | GET | Browser UI — check health, download the model, submit prompts, download images |
+| `GET /ui` | GET | Browser UI (alias of `/`) |
+| `GET /api` | GET | API info / version (JSON) |
 | `GET /health` | GET | Health check — returns `status` + `device`; does not load the model |
-| `POST /generate` | POST | Generate images from a JSON prompt list |
+| `POST /generate` | POST | Generate images **synchronously** (images returned inline). ⚠️ On cloud CPU this can exceed the ACA ingress request timeout (~240s) — the connection is dropped before the response starts. Use `/generate/async` from a browser, or the CLI script with a long timeout. |
+| `POST /generate/async` | POST | Start generation in the background; returns `202` immediately. Same body as `/generate`. |
+| `GET /generate/status` | GET | Poll generation state: `idle` / `in_progress` / `ready` / `error`. When `ready`, `results[]` carries each image as `image_base64`. |
+| `POST /model/pull` | POST | Start async model download/warm-up; returns `202`. |
+| `GET /model/status` | GET | Poll model warm-up state: `not_started` / `in_progress` / `ready` / `error`. |
+
+> **Why async?** Synchronous `POST /generate` holds one HTTP request open until every image renders. On CPU a single image can take minutes, which exceeds the Azure Container Apps HTTP ingress request timeout (~240s) — the connection is killed before the response starts and you get a *stream timeout* with no image. `POST /generate/async` + polling `GET /generate/status` avoids this entirely. The browser UI at `/` uses the async endpoints automatically.
+>
+> **Azure Files SMB + HuggingFace file lock:** the model cache is an Azure Files SMB share, which does **not** support POSIX `flock()`. HuggingFace's default `filelock.FileLock` uses `flock` and crashes with `PermissionError: [Errno 13]` on the share. The app forces HuggingFace to use `SoftFileLock` (a lock-file, no `flock` syscall) before importing diffusers/`huggingface_hub`, so downloads work on the share. See the patch in `src/image_generation/generate.py` and `scripts/download_model.py`.
+
+### Async generation (recommended for CPU / browser)
+
+Kick off generation, then poll until it's `ready` — no long-held request, so it never hits the ingress timeout:
+
+```powershell
+$fqdn = "<your-fqdn>"
+$body = '{"prompts":[{"prompt":"a serene tropical beach at sunset","output":"beach.png"}],"steps":15,"width":512,"height":512,"cpu":true}'
+Invoke-RestMethod -Uri "https://$fqdn/generate/async" -Method Post -ContentType "application/json" -Body $body
+do {
+  Start-Sleep 20
+  $s = Invoke-RestMethod "https://$fqdn/generate/status"
+  "state=$($s.state)"
+} until ($s.state -eq "ready" -or $s.state -eq "error")
+if ($s.state -eq "ready") {
+  [IO.File]::WriteAllBytes("beach.png", [Convert]::FromBase64String($s.results[0].image_base64))
+  "Saved beach.png"
+}
+```
+
+```bash
+FQDN="<your-fqdn>"
+curl -X POST "https://$FQDN/generate/async" -H "Content-Type: application/json" \
+  -d '{"prompts":[{"prompt":"a serene tropical beach at sunset","output":"beach.png"}],"steps":15,"width":512,"height":512,"cpu":true}'
+until [ "$(curl -s "https://$FQDN/generate/status" | jq -r '.state')" = "ready" ]; do
+  echo "waiting..."; sleep 20
+done
+curl -s "https://$FQDN/generate/status" | jq -r '.results[0].image_base64' | base64 -d > beach.png
+```
+
+Or just open `https://<fqdn>/` in a browser — the UI drives `/model/pull`, `/generate/async`, and polling for you, then offers each image as a download.
 
 ### Get your deployed URL
 
