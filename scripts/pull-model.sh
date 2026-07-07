@@ -31,7 +31,20 @@
 # safe.
 set -eu
 
-echo "SDXL API deployed successfully"
+# --- telemetry helpers -------------------------------------------------------
+# Every line is prefixed with elapsed time since the hook started (t+MM:SS) so
+# a long cold download is observable. Byte-level HF download progress is not
+# tracked by the app; it appears in the container console logs
+# (az containerapp logs show --type console). This hook reports state + the
+# app's own message/elapsed each poll.
+HOOK_START=$(date +%s)
+elapsed() {
+  _now=$(date +%s); _d=$(( _now - HOOK_START ))
+  printf '%02d:%02d' $(( _d / 60 )) $(( _d % 60 ))
+}
+log() { echo "pull-model: [t+$(elapsed)] $1"; }
+
+log "SDXL API deployed successfully"
 
 if [ -z "${containerAppUrl:-}" ]; then
   echo "pull-model: containerAppUrl output not set; skipping model warm-up." >&2
@@ -39,7 +52,7 @@ if [ -z "${containerAppUrl:-}" ]; then
 fi
 
 BASE="https://${containerAppUrl}"
-echo "pull-model: Service URL: ${BASE}"
+log "Service URL: ${BASE}"
 
 repair_container_command() {
   # Reset a stranded placeholder http.server command to the real Flask
@@ -51,20 +64,20 @@ repair_container_command() {
   current=$(az containerapp show -n "${containerAppName}" -g "${AZURE_RESOURCE_GROUP}" \
     --query 'properties.template.containers[0].command' -o tsv 2>/dev/null | tr '\t' ' ' | tr -s ' ' | sed 's/ *$//')
   if [ "${current}" = "python3 app.py" ]; then
-    echo "pull-model: container command already python3 app.py."
+    log "container command already python3 app.py."
     return 0
   fi
-  echo "pull-model: container command is '${current}'; resetting to 'python3 app.py' (undo placeholder http.server)."
+  log "container command is '${current}'; resetting to 'python3 app.py' (undo placeholder http.server)."
   if ! az containerapp update -n "${containerAppName}" -g "${AZURE_RESOURCE_GROUP}" \
       --command 'python3' 'app.py' >/dev/null 2>&1; then
     echo "pull-model: failed to reset container command; continuing anyway." >&2
     return 0
   fi
-  echo "pull-model: waiting for the Flask revision to answer /health..."
+  log "waiting for the Flask revision to answer /health..."
   health_deadline=$(( $(date +%s) + 600 ))   # 10 minutes
   while :; do
     if curl -fsS "${BASE}/health" >/dev/null 2>&1; then
-      echo "pull-model: Flask /health is up."
+      log "Flask /health is up."
       return 0
     fi
     if [ "$(date +%s)" -ge "${health_deadline}" ]; then
@@ -77,13 +90,17 @@ repair_container_command() {
 
 repair_container_command
 
-get_state() {
-  curl -fsS "${BASE}/model/status" 2>/dev/null \
-    | sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+get_status_body() { curl -fsS "${BASE}/model/status" 2>/dev/null; }
+
+json_str() {  # $1=body $2=key -> string value
+  printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p"
+}
+json_num() {  # $1=body $2=key -> numeric value
+  printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\([0-9.][0-9.]*\).*/\1/p"
 }
 
 trigger_pull() {
-  echo "pull-model: triggering POST ${BASE}/model/pull"
+  log "triggering POST ${BASE}/model/pull"
   curl -fsS -X POST "${BASE}/model/pull" \
     -H "Content-Type: application/json" -d '{}' >/dev/null 2>&1 \
     || echo "pull-model: /model/pull request failed (will retry on next poll)" >&2
@@ -91,17 +108,40 @@ trigger_pull() {
 
 trigger_pull
 
-echo "pull-model: polling ${BASE}/model/status until ready (a cold ~7-13GB HF download can take several minutes)…"
-DEADLINE=$(( $(date +%s) + 2700 ))   # 45 minutes
+log "polling ${BASE}/model/status until ready (a cold ~7-13GB HF download can take several minutes)…"
+log "tip: live download progress is in the container console logs — az containerapp logs show --type console --follow"
+
+# Overall deadline is configurable via PULL_MODEL_TIMEOUT_MIN (default 45m).
+TIMEOUT_MIN="${PULL_MODEL_TIMEOUT_MIN:-45}"
+DEADLINE=$(( $(date +%s) + TIMEOUT_MIN * 60 ))
+log "overall deadline: ${TIMEOUT_MIN}m (set PULL_MODEL_TIMEOUT_MIN to change)."
+
 # Fail-fast guard: a healthy Flask app returns a real state within seconds.
 # A sustained 'unknown' streak means /model/status is 404/unreachable (e.g. the
-# command self-heal did not take), so bail after ~5m instead of hanging 45m.
+# command self-heal did not take), so bail after ~5m instead of hanging.
 UNKNOWN_STREAK=0
 UNKNOWN_MAX=30   # 30 polls * 10s = 5 minutes
+POLL=0
+LAST_STATE=""
 while :; do
-  STATE=$(get_state || true)
-  STATE="${STATE:-unknown}"
-  echo "pull-model: state=${STATE}"
+  POLL=$(( POLL + 1 ))
+  BODY=$(get_status_body || true)
+  if [ -z "${BODY}" ]; then
+    STATE="unknown"
+    log "poll #${POLL} state=unknown (/model/status unreachable)"
+  else
+    STATE=$(json_str "${BODY}" state); STATE="${STATE:-unknown}"
+    MSG=$(json_str "${BODY}" message)
+    ELAP=$(json_num "${BODY}" elapsed_seconds)
+    DETAIL=""
+    [ -n "${MSG}" ] && DETAIL=" — ${MSG}"
+    [ -n "${ELAP}" ] && DETAIL="${DETAIL} [app elapsed ${ELAP}s]"
+    log "poll #${POLL} state=${STATE}${DETAIL}"
+  fi
+  if [ -n "${LAST_STATE}" ] && [ "${STATE}" != "${LAST_STATE}" ]; then
+    log "state transition: ${LAST_STATE} -> ${STATE}"
+  fi
+  LAST_STATE="${STATE}"
   if [ "${STATE}" = "unknown" ]; then
     UNKNOWN_STREAK=$(( UNKNOWN_STREAK + 1 ))
   else
@@ -109,11 +149,12 @@ while :; do
   fi
   case "${STATE}" in
     ready)
-      echo "pull-model: model is ready on the share."
+      log "model is ready on the share. total hook time t+$(elapsed)."
       exit 0
       ;;
     error)
-      echo "pull-model: model pull reported error." >&2
+      ERR=$(json_str "${BODY:-}" error); ERR="${ERR:-see container logs}"
+      echo "pull-model: model pull reported error: ${ERR}" >&2
       exit 1
       ;;
     not_started)
@@ -129,7 +170,7 @@ while :; do
     exit 1
   fi
   if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
-    echo "pull-model: timed out after 45m waiting for model to become ready." >&2
+    echo "pull-model: timed out after ${TIMEOUT_MIN}m waiting for model to become ready." >&2
     exit 1
   fi
   sleep 10

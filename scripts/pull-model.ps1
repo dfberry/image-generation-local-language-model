@@ -30,7 +30,21 @@
 # safe.
 $ErrorActionPreference = 'Stop'
 
-Write-Host 'SDXL API deployed successfully'
+# --- telemetry helpers -------------------------------------------------------
+# Every line is prefixed with elapsed time since the hook started (t+MM:SS) so
+# a long cold download is observable. NOTE: byte-level download progress is not
+# tracked by the app; the HF download bars appear in the container console logs
+# (az containerapp logs show --type console). This hook reports state + the
+# app's own message/elapsed each poll.
+$hookStart = Get-Date
+function Get-Elapsed {
+  param([datetime]$From = $hookStart)
+  $d = (Get-Date) - $From
+  return ('{0:D2}:{1:D2}' -f [int][math]::Floor($d.TotalMinutes), $d.Seconds)
+}
+function Log { param([string]$Message) Write-Host ("pull-model: [t+{0}] {1}" -f (Get-Elapsed), $Message) }
+
+Log 'SDXL API deployed successfully'
 
 if (-not $env:containerAppUrl) {
   Write-Warning 'pull-model: containerAppUrl output not set; skipping model warm-up.'
@@ -38,7 +52,7 @@ if (-not $env:containerAppUrl) {
 }
 
 $base = "https://$($env:containerAppUrl)"
-Write-Host "pull-model: Service URL: $base"
+Log "Service URL: $base"
 
 function Repair-ContainerCommand {
   # Reset a stranded placeholder http.server command to the real Flask
@@ -56,10 +70,10 @@ function Repair-ContainerCommand {
   }
   $joined = ($current -join ' ')
   if ($joined -eq 'python3 app.py') {
-    Write-Host 'pull-model: container command already python3 app.py.'
+    Log 'container command already python3 app.py.'
     return
   }
-  Write-Host "pull-model: container command is '$joined'; resetting to 'python3 app.py' (undo placeholder http.server)."
+  Log "container command is '$joined'; resetting to 'python3 app.py' (undo placeholder http.server)."
   try {
     az containerapp update -n $env:containerAppName -g $env:AZURE_RESOURCE_GROUP `
       --command 'python3' 'app.py' 2>&1 | Out-Null
@@ -67,12 +81,12 @@ function Repair-ContainerCommand {
     Write-Warning "pull-model: failed to reset container command: $($_.Exception.Message)"
     return
   }
-  Write-Host 'pull-model: waiting for the Flask revision to answer /health...'
+  Log 'waiting for the Flask revision to answer /health...'
   $healthDeadline = (Get-Date).AddMinutes(10)
   while ($true) {
     try {
       $r = Invoke-WebRequest -Uri "$base/health" -TimeoutSec 15 -UseBasicParsing
-      if ($r.StatusCode -eq 200) { Write-Host 'pull-model: Flask /health is up.'; return }
+      if ($r.StatusCode -eq 200) { Log 'Flask /health is up.'; return }
     } catch { }
     if ((Get-Date) -ge $healthDeadline) {
       Write-Warning 'pull-model: /health not up after 10m; continuing to model warm-up anyway.'
@@ -84,13 +98,14 @@ function Repair-ContainerCommand {
 
 Repair-ContainerCommand
 
-function Get-ModelState {
-  try { return (Invoke-RestMethod -Uri "$base/model/status" -TimeoutSec 30).state }
-  catch { return 'unknown' }
+function Get-ModelStatus {
+  # Return the full status object, or $null when unreachable.
+  try { return (Invoke-RestMethod -Uri "$base/model/status" -TimeoutSec 30) }
+  catch { return $null }
 }
 
 function Invoke-Pull {
-  Write-Host "pull-model: triggering POST $base/model/pull"
+  Log "triggering POST $base/model/pull"
   try {
     Invoke-RestMethod -Method Post -Uri "$base/model/pull" -ContentType 'application/json' -Body '{}' -TimeoutSec 30 | Out-Null
   } catch {
@@ -100,20 +115,53 @@ function Invoke-Pull {
 
 Invoke-Pull
 
-Write-Host "pull-model: polling $base/model/status until ready (a cold ~7-13GB HF download can take several minutes)..."
-$deadline = (Get-Date).AddMinutes(45)
+Log 'polling /model/status until ready (a cold ~7-13GB HF download can take several minutes)...'
+Log 'tip: live download progress is in the container console logs — az containerapp logs show --type console --follow'
+
+# Overall deadline is configurable via PULL_MODEL_TIMEOUT_MIN (default 45m).
+$deadlineMinutes = 45
+if ($env:PULL_MODEL_TIMEOUT_MIN) {
+  try { $deadlineMinutes = [int]$env:PULL_MODEL_TIMEOUT_MIN } catch { }
+}
+$deadline = $hookStart.AddMinutes($deadlineMinutes)
+Log "overall deadline: ${deadlineMinutes}m (set PULL_MODEL_TIMEOUT_MIN to change)."
+
 # Fail-fast guard: a healthy Flask app returns a real state within seconds.
 # A sustained 'unknown' streak means /model/status is 404/unreachable (e.g. the
-# command self-heal did not take), so bail after ~5m instead of hanging 45m.
+# command self-heal did not take), so bail after ~5m instead of hanging.
 $unknownStreak = 0
 $unknownMax = 30   # 30 polls * 10s = 5 minutes
+$poll = 0
+$lastState = ''
 while ($true) {
-  $state = Get-ModelState
-  Write-Host "pull-model: state=$state"
+  $poll++
+  $status = Get-ModelStatus
+  if ($null -eq $status) {
+    $state = 'unknown'
+    Log ("poll #{0} state=unknown (/model/status unreachable)" -f $poll)
+  } else {
+    $state = $status.state
+    $detail = ''
+    if ($status.message) { $detail = " — $($status.message)" }
+    if ($null -ne $status.elapsed_seconds) {
+      $detail += " [app elapsed $([math]::Round([double]$status.elapsed_seconds,0))s]"
+    } elseif ($status.started_at) {
+      $detail += " [started $($status.started_at)]"
+    }
+    Log ("poll #{0} state={1}{2}" -f $poll, $state, $detail)
+  }
+  if ($lastState -ne '' -and $state -ne $lastState) {
+    Log ("state transition: $lastState -> $state")
+  }
+  $lastState = $state
   if ($state -eq 'unknown') { $unknownStreak++ } else { $unknownStreak = 0 }
   switch ($state) {
-    'ready'       { Write-Host 'pull-model: model is ready on the share.'; exit 0 }
-    'error'       { Write-Error 'pull-model: model pull reported error.'; exit 1 }
+    'ready'       { Log "model is ready on the share. total hook time t+$(Get-Elapsed)."; exit 0 }
+    'error'       {
+      $err = if ($status -and $status.error) { $status.error } else { 'see container logs' }
+      Write-Error "pull-model: model pull reported error: $err"
+      exit 1
+    }
     'not_started' { Invoke-Pull }   # cold revision now serving (traffic shift) — re-trigger
     # in_progress / unknown: keep waiting.
   }
@@ -123,7 +171,7 @@ while ($true) {
     exit 1
   }
   if ((Get-Date) -ge $deadline) {
-    Write-Error 'pull-model: timed out after 45m waiting for model to become ready.'
+    Write-Error "pull-model: timed out after ${deadlineMinutes}m waiting for model to become ready."
     exit 1
   }
   Start-Sleep -Seconds 10
