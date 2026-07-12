@@ -43,9 +43,8 @@ The deployment flow also had an operator-experience problem: a blocking `azd` po
 - Persist `/model/pull` progress to `<HF_HOME or ~/.cache/huggingface>/.pull-progress.json` on the same durable file share as the Hugging Face cache.
 - Write the progress file atomically using a same-directory temporary file and replacement, so readers never observe partial JSON.
 - Heartbeat progress while `load_base()` downloads or loads the SDXL base model.
-- Make `GET /model/status` always return HTTP 200 with a stable state machine: `not_started`, `in_progress`, `ready`, `error`, `stalled`.
-- Reconcile status against both the durable progress file and the real Hugging Face snapshot cache, including self-healing to `ready` after restart when the cache is populated.
-- Mark stale in-progress durable files as `stalled` when no local pull worker is alive.
+- Make `GET /model/status` always return HTTP 200 using the state machine defined in Section 7.
+- Reconcile status per the rules in Section 8, including cache self-healing and stale-progress handling.
 - Keep `azd` postdeploy non-blocking while still surfacing exact manual warm-up and status commands.
 
 ### Non-Goals
@@ -62,7 +61,7 @@ The deployment flow also had an operator-experience problem: a blocking `azd` po
 - **curl users:** Trigger `POST /model/pull` and poll `GET /model/status` from POSIX shells or `curl.exe`.
 - **PowerShell users:** Trigger and poll with `Invoke-RestMethod` without relying on the `curl` alias.
 - **Python clients:** Poll JSON fields consistently across local and ACA deployments.
-- **Operators running `azd`:** Need `azd up` / `azd deploy` to finish without waiting for the 7 GiB model warm-up.
+- **Operators running `azd`:** Need `azd up` / `azd deploy` to finish without waiting for model warm-up; progress uses the fixed `7516192768`-byte SDXL-base estimate from `app.py`.
 
 ## 6. Requirements
 
@@ -74,15 +73,12 @@ The deployment flow also had an operator-experience problem: a blocking `azd` po
 | FR-2 | Progress file writes MUST use a temp file in the same directory as the final file and atomically replace the final file. | Already implemented | Inspect `app.py` `_write_progress_file()` for `tempfile.mkstemp(..., dir=cache_root)` and `os.replace(temp_path, progress_path)`. |
 | FR-3 | The service MUST heartbeat durable progress during `load_base()` execution. | Already implemented | Inspect `app.py` `_pull_worker()` and `_heartbeat_pull_progress()`; heartbeat interval is `PULL_HEARTBEAT_SECONDS = 5`. |
 | FR-4 | The progress file MUST use the JSON schema in Section 7. | Already implemented | Inspect `app.py` `_progress_payload()`. |
-| FR-5 | `GET /model/status` MUST always return HTTP 200 for valid service requests, including `not_started`, `in_progress`, `ready`, `error`, and `stalled`. | Already implemented | Inspect `app.py` `model_status()`. |
-| FR-6 | `/model/status` MUST read `.pull-progress.json` when present and ignore malformed JSON. | Already implemented | Inspect `app.py` `_read_progress_file()` and `reconcile_model_status()`. |
-| FR-7 | `/model/status` MUST independently check the SDXL base model cache snapshot directory and self-heal to `ready` when cache exists and no local pull worker is active. | Already implemented | Inspect `app.py` `is_base_model_cache_present()` and `reconcile_model_status()`. |
-| FR-8 | `/model/status` MUST mark stale durable `in_progress` state as `stalled` when no local pull worker is active and `last_updated` exceeds the stale window. | Already implemented | Inspect `app.py` `PULL_STALE_AFTER_SECONDS = 120` and `reconcile_model_status()`. |
-| FR-9 | `POST /model/pull` MUST return immediately with 202 when starting or observing an active pull, and MUST not block on the model download/load. | Already implemented | Inspect `app.py` `model_pull()` thread launch. |
-| FR-10 | `POST /model/pull` MUST return 200 when the cache is already `ready` and `force` is not requested. | Already implemented | Inspect `app.py` `model_pull()`. |
-| FR-11 | The `azd` postdeploy hook MUST be non-blocking and MUST print service URL plus manual pull/status instructions only. | Already implemented | Inspect `azure.yaml`, `scripts/pull-model.ps1`, and `scripts/pull-model.sh`. |
-| FR-12 | The ACA app MUST mount the Azure Files share at `/root/.cache/huggingface` when storage parameters are available. | Already implemented | Inspect `infra/resources/aca.bicep` `volumeMounts` and `volumes`; inspect `infra/resources/storage.bicep` Azure Files share registration. |
-| FR-13 | Hugging Face downloads on Azure Files SMB MUST use `SoftFileLock` instead of POSIX `flock()`. | Already implemented | Inspect `src/image_generation/generate.py` filelock patch before importing diffusers. |
+| FR-5 | `GET /model/status` MUST always return HTTP 200 for valid service requests and use the Section 7 state enum. | Already implemented | Inspect `app.py` `model_status()`. |
+| FR-6 | `/model/status` MUST apply the Section 8 reconciliation rules. | Already implemented | Inspect `app.py` `_read_progress_file()`, `is_base_model_cache_present()`, and `reconcile_model_status()` lines 262-323. |
+| FR-7 | `POST /model/pull` MUST return immediately and MUST not block on the model download/load. It returns 202 or 200 under the exact conditions in Section 8. | Already implemented | Inspect `app.py` `model_pull()` lines 793-860. |
+| FR-8 | The `azd` postdeploy hook MUST be non-blocking and MUST print service URL plus manual pull/status instructions only. | Already implemented | Inspect `azure.yaml`, `scripts/pull-model.ps1`, and `scripts/pull-model.sh`. |
+| FR-9 | The ACA app MUST mount the Azure Files share at `/root/.cache/huggingface` when storage parameters are available. | Already implemented | Inspect `infra/resources/aca.bicep` `volumeMounts` and `volumes`; inspect `infra/resources/storage.bicep` Azure Files share registration. |
+| FR-10 | Hugging Face downloads on Azure Files SMB MUST use `SoftFileLock` instead of POSIX `flock()`. | Already implemented | Inspect `src/image_generation/generate.py` filelock patch before importing diffusers. |
 
 ### Non-functional requirements
 
@@ -119,9 +115,9 @@ Progress is persisted as JSON at `<HF_HOME or ~/.cache/huggingface>/.pull-progre
 |---|---|---|---|
 | `state` | string enum | No | One of `not_started`, `in_progress`, `ready`, `error`, `stalled`. |
 | `message` | string | No | Human-readable status summary. |
-| `bytes_downloaded` | integer | No | Current size of the SDXL base model cache directory, best effort. |
-| `bytes_expected` | integer | Yes | Expected SDXL base model bytes. Defaults to approximately 7 GiB through `SDXL_BASE_MODEL_EXPECTED_BYTES`; nullable if expected bytes become unknown in a future implementation. |
-| `percent` | number | Yes | Percent complete from `bytes_downloaded / bytes_expected`, rounded; `null` when expected bytes are unknown or invalid. |
+| `bytes_downloaded` | integer | No | Current `_safe_dir_size()` of the SDXL base model cache directory (`app.py` lines 134-143, 171-173). |
+| `bytes_expected` | integer | No in current code | Fixed SDXL-base estimate from `BASE_MODEL_EXPECTED_BYTES`: default `7516192768` bytes (`7 * 1024 * 1024 * 1024`), overrideable only by `SDXL_BASE_MODEL_EXPECTED_BYTES` (`app.py` lines 71-73). The current implementation always populates this field. |
+| `percent` | number | Yes | Rounded percent from `bytes_downloaded / bytes_expected`; because `bytes_expected` is populated, it is normally computable after at least one byte is present. It is `null` when `bytes_downloaded` is `0` or an invalid/zero expected value is supplied (`app.py` lines 145-148). An unknown-expected-bytes path is not implemented. |
 | `started_at` | ISO 8601 string | Yes | UTC time the current pull attempt started. |
 | `last_updated` | ISO 8601 string | Yes | UTC time the durable progress file was last updated. |
 | `finished_at` | ISO 8601 string | Yes | UTC time the pull finished or failed. |
@@ -144,34 +140,33 @@ Reconciliation rules:
 
 1. Read `.pull-progress.json` if present; ignore missing or malformed JSON.
 2. Compute current `bytes_downloaded` from the SDXL base model cache directory.
-3. Check `<HF hub cache>/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots` and minimum cache size independently.
-4. If the cache is present and no local pull worker is active, return `state=ready`, even after an ACA restart or revision replacement.
-5. If durable state says `ready` but the cache is absent, return `state=not_started`.
-6. If durable state says `in_progress`, no local worker is active, and `last_updated` is older than the stale window, return `state=stalled`.
+3. Check `<HF hub cache>/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots` for at least one snapshot directory and require `_safe_dir_size(model_path) >= BASE_MODEL_READY_MIN_BYTES`. The default ready threshold is `5368709120` bytes (`5 * 1024 * 1024 * 1024`), overrideable by `SDXL_BASE_MODEL_READY_MIN_BYTES` (`app.py` lines 74-76, 235-254).
+4. If the cache is present and no local pull worker is active, return `state=ready`, even after an ACA restart or revision replacement (`app.py` lines 293-306).
+5. If durable state says `ready` but the cache is absent, return `state=not_started` (`app.py` lines 309-316).
+6. If durable state says `in_progress`, no local worker is active, and `last_updated` is more than `120` seconds old, return `state=stalled` (`PULL_STALE_AFTER_SECONDS = 120`, `app.py` lines 69 and 317-328).
 
 ### `POST /model/pull`
 
-- Starts a background thread that calls `load_base(device)` and returns without waiting for the model download/load.
-- Returns `202` with reconciled progress when a pull starts or is already in progress.
-- Returns `200` when the model is already cached and `force` is not requested.
-- Accepts optional JSON body `{ "force": true }` to start a new pull even if current status is ready.
-- Writes durable progress before and during the background work.
-- Releases the in-memory pipeline after warming the on-disk Hugging Face cache; `/generate` reloads from the warm cache when needed.
+- Reads optional JSON body `{ "force": true }`; omitted, malformed, or falsy `force` is treated as `false` (`app.py` lines 807-808).
+- Returns `202` with message `Pull already in progress.` when a local worker is alive, regardless of `force`, or when reconciled state is `in_progress` and `force` is false (`app.py` lines 811-818). This deduplicates simultaneous calls instead of starting another worker.
+- Returns `200` with message `Model is already cached. Pass {"force": true} to re-pull.` when reconciled state is `ready` and `force` is false (`app.py` lines 820-824).
+- Returns `202` when it transitions state to `in_progress`, writes durable progress, launches a background thread calling `_pull_worker()` / `load_base(device)`, and returns without waiting for download/load completion (`app.py` lines 826-860).
+- With `force=true`, starts a new pull only if no local worker is alive; it bypasses `ready` and non-stale `in_progress` durable state checks, but not the active-worker guard.
+- Writes durable progress before and during the background work, then releases the in-memory pipeline after warming the on-disk Hugging Face cache; `/generate` reloads from the warm cache when needed.
 
 ## 9. Acceptance Criteria
 
 | ID | Criterion | Verification |
 |---|---|---|
 | AC-1 | After `POST /model/pull`, `.pull-progress.json` exists under the HF cache root and includes `state`, byte counts, timestamps, cache path, and revision. | Run the API with `HF_HOME` set to a test directory, call `/model/pull`, and inspect `<HF_HOME>/.pull-progress.json`. |
-| AC-2 | During a long `load_base()` operation, `last_updated` advances at least once every heartbeat interval plus reasonable scheduling tolerance. | Observe `.pull-progress.json` updates while the model is downloading/loading. |
+| AC-2 | During a long `load_base()` operation, `last_updated` advances every `PULL_HEARTBEAT_SECONDS = 5` seconds while the heartbeat thread is scheduled; `stalled` is not reported until no local worker is active and the last update is more than `120` seconds old. | Observe `.pull-progress.json` updates while the model is downloading/loading; inspect `app.py` lines 68-69 and 331-340. |
 | AC-3 | Progress-file writes are atomic from the reader perspective; no client receives partial JSON. | Inspect `_write_progress_file()` and run repeated `GET /model/status` calls during writes without JSON decode failures surfacing to clients. |
 | AC-4 | After an ACA revision restart with a populated Azure Files cache, `GET /model/status` returns `state=ready` without a new pull. | Populate cache, restart/revise ACA, call `GET /model/status`; response is HTTP 200 and `state=ready`. |
 | AC-5 | If `.pull-progress.json` says `in_progress`, no worker is alive, and `last_updated` is stale, `GET /model/status` returns `state=stalled`. | Seed stale progress JSON in HF cache and call `/model/status` with no pull thread. |
 | AC-6 | If the progress file is malformed, `/model/status` ignores it and still returns HTTP 200 based on cache and in-memory state. | Write invalid JSON to the progress path and call `/model/status`. |
-| AC-7 | `POST /model/pull` returns 202 promptly when starting a pull and does not block for the full model download/load. | Time the HTTP call; response returns immediately while background thread continues. |
-| AC-8 | `POST /model/pull` returns 200 when the cache is already ready and `force` is false. | Warm cache, call `/model/pull` without `force`, observe HTTP 200 and ready response. |
-| AC-9 | `azd` postdeploy hook does not call `/model/pull`, does not poll `/model/status`, and prints manual commands instead. | Inspect `scripts/pull-model.ps1` and `scripts/pull-model.sh`; run hook scripts with `containerAppUrl` set and confirm output only. |
-| AC-10 | Azure Files remains mounted at `/root/.cache/huggingface` for the real ACA app container. | Inspect `infra/resources/aca.bicep` `volumeMounts.mountPath`. |
+| AC-7 | `POST /model/pull` follows the Section 8 status-code contract: 202 for an active/existing pull or a newly started worker, and 200 only for already-ready cache with falsy `force`. | Exercise warm cache, active worker, non-stale durable `in_progress`, `force=false`, and `force=true` cases against `model_pull()`. |
+| AC-8 | `azd` postdeploy hook does not call `/model/pull`, does not poll `/model/status`, and prints manual commands instead. | Inspect `scripts/pull-model.ps1` and `scripts/pull-model.sh`; run hook scripts with `containerAppUrl` set and confirm output only. |
+| AC-9 | Azure Files remains mounted at `/root/.cache/huggingface` for the real ACA app container. | Inspect `infra/resources/aca.bicep` `volumeMounts.mountPath`. |
 
 ## 10. Rollout / Deployment Considerations
 
@@ -179,7 +174,7 @@ Reconciliation rules:
 - **Azure Files SMB:** `infra/resources/storage.bicep` provisions a `Standard_LRS` Azure Files share named `models`, registers it as ACA environment storage `models-storage`, and enables SMB. `infra/resources/aca.bicep` mounts that storage to `/root/.cache/huggingface` for the real app container.
 - **Hugging Face cache path:** `app.py` resolves cache root from `HF_HOME` or `~/.cache/huggingface`, and hub cache from `HF_HUB_CACHE` or `<cache_root>/hub`.
 - **SoftFileLock:** `src/image_generation/generate.py` patches `filelock.FileLock` to `SoftFileLock` before importing diffusers, avoiding POSIX `flock()` failures on Azure Files SMB.
-- **Stale threshold:** Current code uses `PULL_STALE_AFTER_SECONDS = 120`. This is short enough to surface dead workers, but long enough for normal 5-second heartbeats to tolerate transient scheduling delays.
+- **Stale threshold:** Current code uses `PULL_STALE_AFTER_SECONDS = 120` seconds (`app.py` line 69). Heartbeats run every `PULL_HEARTBEAT_SECONDS = 5` seconds (`app.py` line 68); stale detection only applies when no local worker is active.
 - **No schema-breaking client changes:** New `/model/status` fields are additive. Existing README guidance that lists states should be updated to include `stalled` wherever the old state list omits it.
 
 ## 11. Future Work
@@ -203,19 +198,29 @@ Out of current scope:
 - Replacing existing `scripts/generate-cloud.ps1` / `scripts/generate-cloud.sh` warm-up options.
 - Making `azd` postdeploy blocking again.
 
+### FW-3: Unknown-size and revision-aware progress
+
+If the service later cannot know expected bytes, add an explicit `bytes_expected: null` implementation and define `percent: null` for that path. If revision-specific readiness matters, make `reconcile_model_status()` compare the requested `SDXL_MODEL_REVISION` with durable progress/cache metadata before self-healing to `ready`.
+
 ## 12. Open Questions
 
-No open technical questions block the current PRD. The core plan decisions are resolved: durable progress file, status reconciliation, and non-blocking postdeploy are in scope and already implemented; ACA warm-up Job and portable Python poller are explicitly deferred.
+| ID | Question | Current code behavior |
+|---|---|---|
+| OQ-1 | Should `percent` ever support an unknown expected-byte path? | Not implemented. `bytes_expected` is always populated from `BASE_MODEL_EXPECTED_BYTES` unless an invalid override is supplied; document any future unknown-size behavior under Future Work before changing the schema. |
+| OQ-2 | Should reconciliation compare `revision` before self-healing to `ready`? | Not implemented. `revision` is recorded from `SDXL_MODEL_REVISION`, but `reconcile_model_status()` determines readiness from cache snapshot presence and the `5368709120`-byte minimum, not from revision matching. |
+| OQ-3 | Should stale detection account for cross-revision clock skew? | Not implemented. `last_updated` is parsed as UTC and compared to the current container clock with a `120`-second threshold. |
 
 ## 13. Risks and Mitigations
 
 | Risk | Mitigation |
 |---|---|
 | Azure Files SMB latency makes byte-size scans slow on very large caches. | `app.py` scopes size checks to the SDXL base model cache directory; future optimization can cache size or scan less frequently if needed. |
-| Stale threshold could mark a slow but alive pull as `stalled` after a restart. | The `stalled` state is only reported when no local worker is active; active workers continue heartbeating every 5 seconds. |
-| `bytes_expected` is approximate, so `percent` may be imperfect. | Treat byte progress as best-effort; readiness is determined by snapshot presence and minimum cache size, not percent alone. |
+| Atomic progress-file replacement can fail on Azure Files or local filesystems. | `_write_progress_file()` writes a temp file in the same directory, `fsync`s it, and calls `os.replace()` (`app.py` lines 196-209). If writing fails, it tries to unlink the temp file and re-raises; `_safe_write_progress()` logs the warning and lets the API continue (`app.py` lines 210-221). |
+| Stale threshold could mark a restarted pull as `stalled` if the new revision has no local worker and the old `last_updated` is more than `120` seconds old. | This is intentional current behavior; active workers heartbeat every 5 seconds, but durable `in_progress` without a local worker is stale after 120 seconds. Clock-skew tolerance beyond that window is not implemented. |
+| `bytes_expected` is a fixed estimate, so `percent` may be imperfect. | Treat byte progress as a progress hint; readiness is determined by snapshot presence plus the `5368709120`-byte minimum, not percent alone. |
 | Malformed progress JSON could confuse clients. | `_read_progress_file()` ignores malformed JSON and `reconcile_model_status()` continues from process/cache state. |
-| Multiple replicas could contend on the same Hugging Face cache share. | Current infra pins `minReplicas: 1` and `maxReplicas: 1`; `SoftFileLock` reduces SMB lock failures for Hugging Face operations. |
+| Multiple simultaneous `/model/pull` calls could otherwise start duplicate workers. | `model_pull()` checks the active thread and non-forced `in_progress` state under `_model_state_lock`; concurrent callers receive 202 `Pull already in progress.` instead of launching a second local worker. Current infra also pins `minReplicas: 1` and `maxReplicas: 1`; cross-replica duplication is not addressed beyond that deployment setting. |
+| Revision changes during or after a pull can leave old bytes on the shared cache. | Current code records `revision` but does not use it in readiness reconciliation. This is tracked as OQ-2/Future Work if revision-specific readiness becomes required. |
 | Operators may assume `azd up` warms the model. | Postdeploy scripts print explicit `POST /model/pull` and `GET /model/status` commands; README documents pre-warming separately. |
 
 ## 14. Scope Fence
