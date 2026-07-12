@@ -9,7 +9,8 @@ Endpoints:
   GET  /health       - Health check (no model load)
   POST /generate     - Generate images from a batch config (synchronous; loads model on first call)
   POST /generate/async - Start background generation; returns 202 immediately
-  GET  /generate/status - Poll generation state: idle | in_progress | ready | error
+  GET  /generate/status - Poll generation state: idle | in_progress | ready | error | cancelled
+  POST /generate/cancel - Request cancellation of async generation
   POST /model/pull   - Kick off async model download/warm-up; returns 202 immediately
   GET  /model/status - Poll warm-up state: not_started | in_progress | ready | error | stalled
 
@@ -30,7 +31,9 @@ import torch
 from flask import Flask, request, jsonify, make_response
 from datetime import datetime, timezone
 
-from src.image_generation.generate import run_batch, OOMError, get_device, load_base
+from src.image_generation.generate import (
+    run_batch, OOMError, GenerationCancelled, get_device, load_base
+)
 
 
 # Setup logging
@@ -82,6 +85,7 @@ _model_state: dict = {
     "bytes_downloaded": 0,
     "bytes_expected": BASE_MODEL_EXPECTED_BYTES,
     "percent": 0.0,
+    "weights_present": False,
     "started_at": None,
     "last_updated": None,
     "finished_at": None,
@@ -293,18 +297,18 @@ def reconcile_model_status(
     model_present = is_base_model_cache_present(
         cache_root, min_ready_bytes=min_ready_bytes
     )
+    base["weights_present"] = model_present
     if model_present and not active_worker:
         base.update({
             "state": "ready",
             "message": "Model weights are present on the HF cache share.",
             "bytes_downloaded": _safe_dir_size(cache_path),
             "bytes_expected": BASE_MODEL_EXPECTED_BYTES,
+            "percent": 100.0,
+            "weights_present": True,
             "finished_at": base.get("finished_at") or base.get("last_updated"),
             "error": None,
         })
-        base["percent"] = _calculate_percent(
-            base.get("bytes_downloaded"), base.get("bytes_expected")
-        )
     elif base.get("state") == "ready" and not model_present:
         base.update({
             "state": "not_started",
@@ -456,8 +460,9 @@ def _pull_worker() -> None:
 # for the result instead of holding one long request open.
 # ---------------------------------------------------------------------------
 _gen_state_lock = threading.Lock()
+_gen_cancel = threading.Event()
 _gen_state: dict = {
-    "state": "idle",          # idle | in_progress | ready | error
+    "state": "idle",          # idle | in_progress | ready | error | cancelled
     "message": "No generation has been requested yet.",
     "results": [],
     "device": None,
@@ -465,6 +470,12 @@ _gen_state: dict = {
     "finished_at": None,
     "elapsed_seconds": None,
     "error": None,
+    "percent": 0.0,
+    "step": 0,
+    "total_steps": 0,
+    "image_index": 0,
+    "image_count": 0,
+    "phase": None,
 }
 
 
@@ -482,6 +493,7 @@ def _run_generation(config: dict) -> None:
             return default
 
         prompts = config.get("prompts", [])
+        image_count = len(prompts)
         steps = int(_resolve("steps", 40))
         guidance = float(_resolve("guidance", 7.5))
         width = int(_resolve("width", 1024))
@@ -489,7 +501,53 @@ def _run_generation(config: dict) -> None:
         refine = _resolve("refine", False)
         use_cpu = _resolve("cpu", False)
         device = "cpu" if use_cpu else get_device(use_cpu)
-        logger.info(f"generate(async): {len(prompts)} image(s) on device: {device}")
+        logger.info(f"generate(async): {image_count} image(s) on device: {device}")
+
+        current_image_index = 0
+        with _gen_state_lock:
+            _gen_state.update({
+                "state": "in_progress",
+                "message": "Generation started.",
+                "results": [],
+                "device": device,
+                "started_at": started.isoformat(),
+                "finished_at": None,
+                "elapsed_seconds": None,
+                "error": None,
+                "percent": 0.0,
+                "step": 0,
+                "total_steps": steps,
+                "image_index": 0,
+                "image_count": image_count,
+                "phase": None,
+            })
+
+        def item_callback(index: int) -> None:
+            nonlocal current_image_index
+            current_image_index = index
+            denominator = max(1, image_count * max(1, steps))
+            with _gen_state_lock:
+                _gen_state.update({
+                    "image_index": index,
+                    "image_count": image_count,
+                    "step": 0,
+                    "total_steps": steps,
+                    "phase": None,
+                    "percent": max(0.0, min(100.0, (index * steps) / denominator * 100.0)),
+                })
+
+        def progress_callback(completed: int, total: int, phase: str) -> None:
+            denominator = max(1, image_count * max(1, total))
+            overall = ((current_image_index * total) + completed) / denominator * 100.0
+            with _gen_state_lock:
+                _gen_state.update({
+                    "percent": max(0.0, min(100.0, overall)),
+                    "step": completed,
+                    "total_steps": total,
+                    "image_index": current_image_index,
+                    "image_count": image_count,
+                    "phase": phase,
+                })
 
         batch_items = []
         for p_obj in prompts:
@@ -508,6 +566,9 @@ def _run_generation(config: dict) -> None:
             height=height,
             refine=refine,
             cpu=use_cpu,
+            progress_callback=progress_callback,
+            cancel_check=_gen_cancel.is_set,
+            item_callback=item_callback,
         )
 
         # Enrich ok results with base64 image bytes (ephemeral cloud filesystem).
@@ -539,8 +600,26 @@ def _run_generation(config: dict) -> None:
                 "finished_at": finished.isoformat(),
                 "elapsed_seconds": (finished - started).total_seconds(),
                 "error": None,
+                "percent": 100.0,
+                "step": steps,
+                "total_steps": steps,
+                "image_index": max(0, image_count - 1),
+                "image_count": image_count,
+                "phase": "complete",
             })
 
+    except GenerationCancelled:
+        finished = datetime.now(timezone.utc)
+        logger.info("generate(async): cancelled by user")
+        with _gen_state_lock:
+            _gen_state.update({
+                "state": "cancelled",
+                "message": "Generation cancelled by user.",
+                "results": [],
+                "finished_at": finished.isoformat(),
+                "elapsed_seconds": (finished - started).total_seconds(),
+                "error": None,
+            })
     except (OOMError, Exception) as exc:
         finished = datetime.now(timezone.utc)
         msg = str(exc)
@@ -874,6 +953,7 @@ def model_status():
           "bytes_downloaded": <number>,
           "bytes_expected": <number|null>,
           "percent": <number|null>,
+          "weights_present": <boolean>,
           "started_at": "<ISO8601 or null>",
           "last_updated": "<ISO8601 or null>",
           "finished_at": "<ISO8601 or null>",
@@ -926,6 +1006,7 @@ def generate_async():
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }), 202
 
+        _gen_cancel.clear()
         _gen_state.update({
             "state": "in_progress",
             "message": "Generation started.",
@@ -935,6 +1016,12 @@ def generate_async():
             "finished_at": None,
             "elapsed_seconds": None,
             "error": None,
+            "percent": 0.0,
+            "step": 0,
+            "total_steps": 0,
+            "image_index": 0,
+            "image_count": len(config.get("prompts", [])),
+            "phase": None,
         })
 
     threading.Thread(
@@ -949,6 +1036,19 @@ def generate_async():
     }), 202
 
 
+@app.route("/generate/cancel", methods=["POST"])
+def generate_cancel():
+    """Request cooperative cancellation of the current async generation."""
+    _gen_cancel.set()
+    with _gen_state_lock:
+        running = _gen_state.get("state") == "in_progress"
+    return jsonify({
+        "state": "cancelling" if running else "idle",
+        "message": "Generation cancellation requested." if running else "No generation is running.",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }), 202
+
+
 @app.route("/generate/status", methods=["GET"])
 def generate_status():
     """
@@ -959,8 +1059,10 @@ def generate_status():
     including "image_base64" for download.
 
     Response (always HTTP 200):
-        { "state": "idle"|"in_progress"|"ready"|"error",
+        { "state": "idle"|"in_progress"|"ready"|"error"|"cancelled",
           "message": "...", "results": [...], "device": "...",
+          "percent": <number>, "step": <number>, "total_steps": <number>,
+          "image_index": <number>, "image_count": <number>, "phase": "...",
           "started_at": "...", "finished_at": "...",
           "elapsed_seconds": <number|null>, "error": "<string|null>",
           "timestamp": "..." }
@@ -1133,6 +1235,7 @@ def browser_ui():
         '    <div class="status-row">\n'
         '      <span class="badge grey" id="pull-badge">—</span>\n'
         '      <span id="pull-msg" style="font-size:.82rem;color:#94a3b8"></span>\n'
+        '      <span class="elapsed" id="pull-elapsed"></span>\n'
         '    </div>\n'
         '    <div id="pull-progress" class="progress hidden"><div id="pull-progress-fill" class="progress-fill pulse"></div></div>\n'
         '    <div id="pull-progress-text" class="elapsed hidden" style="margin-top:.35rem"></div>\n'
@@ -1140,6 +1243,7 @@ def browser_ui():
         '      <span class="spinner"></span>\n'
         '      <span style="font-size:.78rem;color:#71717a">Polling /model/status…</span>\n'
         '      <span class="elapsed" id="pull-poll-elapsed"></span>\n'
+        '      <button class="sec" onclick="stopPullPoll()">Stop polling</button>\n'
         '    </div>\n'
         '    <div id="pull-err" class="err-box hidden"></div>\n'
         '    <details><summary>JSON response (pull)</summary><pre id="pull-pre"></pre></details>\n'
@@ -1192,22 +1296,30 @@ def browser_ui():
         '\n'
         '  <div class="controls" style="margin-top:.5rem">\n'
         '    <button onclick="callGenerate()" id="btn-gen">Generate</button>\n'
+        '    <button class="sec" onclick="callGenerateCancel()" id="btn-gen-stop" disabled>Stop</button>\n'
         '    <span id="gen-spin" class="hidden"><span class="spinner"></span>Generating… (may take minutes on CPU)</span>\n'
         '    <button class="sec hidden" id="btn-dl-all" onclick="downloadAll()">Download all images</button>\n'
         '  </div>\n'
         '  <div id="gen-err" class="err-box hidden"></div>\n'
+        '  <div id="gen-status" class="status-row hidden">\n'
+        '    <span class="badge grey" id="gen-badge">—</span>\n'
+        '    <span id="gen-msg" style="font-size:.82rem;color:#94a3b8"></span>\n'
+        '  </div>\n'
+        '  <div id="gen-progress" class="progress hidden"><div id="gen-progress-fill" class="progress-fill pulse"></div></div>\n'
+        '  <div id="gen-progress-text" class="elapsed hidden" style="margin-top:.35rem"></div>\n'
         '\n'
         '  <div id="gen-resp" class="response-wrap hidden">\n'
         '    <details><summary id="gen-resp-label">JSON response</summary><pre id="gen-pre"></pre></details>\n'
         '  </div>\n'
         '  <div id="gen-imgs" class="img-grid"></div>\n'
+
         '</div>\n'
         '\n'
         '<script>\n'
         'const B="";\n'
         '\n'
         '// helpers\n'
-        'function bc(s){if(s==="healthy"||s==="ready"||s==="ok")return"ok";if(s==="in_progress")return"info";if(s==="error")return"err";if(s==="not_started")return"grey";if(s==="stalled")return"warn";return"warn";}\n'
+        'function bc(s){if(s==="healthy"||s==="ready"||s==="ok")return"ok";if(s==="in_progress")return"info";if(s==="error")return"err";if(s==="not_started")return"grey";if(s==="stalled")return"warn";if(s==="cancelled")return"grey";return"warn";}\n'
         'function badge(el,txt,cls){el.textContent=txt;el.className="badge "+cls;}\n'
         'function show(id){document.getElementById(id).classList.remove("hidden");}\n'
         'function hide(id){document.getElementById(id).classList.add("hidden");}\n'
@@ -1236,14 +1348,38 @@ def browser_ui():
         '  const fill=document.getElementById(prefix+"-progress-fill");\n'
         '  const txt=document.getElementById(prefix+"-progress-text");\n'
         '  if(!bar||!fill||!txt)return;\n'
+        '  const state=d.state||"unknown";\n'
         '  const hasBytes=d.bytes_downloaded!=null||d.bytes_expected!=null;\n'
         '  const pct=d.percent!=null?Number(d.percent):null;\n'
-        '  if(!hasBytes&&pct==null){bar.classList.add("hidden");txt.classList.add("hidden");return;}\n'
+        '  if(!hasBytes&&pct==null&&state!=="ready"){bar.classList.add("hidden");txt.classList.add("hidden");return;}\n'
         '  bar.classList.remove("hidden");txt.classList.remove("hidden");\n'
+        '  if(state==="ready"){\n'
+        '    fill.classList.remove("pulse");fill.style.width="100%";\n'
+        '    const cache=d.bytes_downloaded!=null?" · cache: "+fmtBytes(d.bytes_downloaded)+" on disk":"";\n'
+        '    txt.textContent="Model cached — weights present on HF share"+cache;\n'
+        '    return;\n'
+        '  }\n'
+        '  if(state==="in_progress"){\n'
+        '    fill.classList.add("pulse");fill.style.width="35%";\n'
+        '    txt.textContent="Downloading… ≈"+fmtBytes(d.bytes_downloaded)+" on disk (progress approximate)"+(d.last_updated?" · last updated "+new Date(d.last_updated).toLocaleString():"");\n'
+        '    return;\n'
+        '  }\n'
         '  if(pct!=null){fill.classList.remove("pulse");fill.style.width=Math.max(0,Math.min(100,pct))+"%";}\n'
         '  else{fill.classList.add("pulse");fill.style.width="35%";}\n'
         '  const label=(pct!=null?pct.toFixed(1)+"% · ":"")+fmtBytes(d.bytes_downloaded)+" / "+(d.bytes_expected?fmtBytes(d.bytes_expected):"unknown expected");\n'
         '  txt.textContent=label+(d.last_updated?" · last updated "+new Date(d.last_updated).toLocaleString():"");\n'
+        '}\n'
+        'function renderModelState(d){\n'
+        '  const s=d.state||"unknown";\n'
+        '  ["mstatus","pull"].forEach(prefix=>{\n'
+        '    const result=document.getElementById(prefix+"-result");if(result)result.classList.remove("hidden");\n'
+        '    badge(document.getElementById(prefix+"-badge"),s,bc(s));\n'
+        '    setText(prefix+"-msg",d.message||"");\n'
+        '    const elapsed=document.getElementById(prefix+"-elapsed");if(elapsed)elapsed.textContent=modelMeta(d);\n'
+        '    renderProgress(prefix,d);\n'
+        '    const err=document.getElementById(prefix+"-err");\n'
+        '    if(err){if(s==="error"&&d.error){err.textContent=d.error;err.classList.remove("hidden");}else{err.classList.add("hidden");}}\n'
+        '  });\n'
         '}\n'
         '\n'
         '// ── 1. GET /api ──────────────────────────────────────────────────\n'
@@ -1283,14 +1419,10 @@ def browser_ui():
         '  show("mstatus-spin");\n'
         '  try{\n'
         '    const r=await fetch(B+"/model/status");const d=await r.json();\n'
-        '    const s=d.state||"unknown";\n'
-        '    badge(document.getElementById("mstatus-badge"),s,bc(s));\n'
-        '    setText("mstatus-msg",d.message||"");\n'
-        '    setText("mstatus-elapsed",modelMeta(d));\n'
-        '    renderProgress("mstatus",d);\n'
-        '    if(s==="error"&&d.error){setText("mstatus-err",d.error);show("mstatus-err");}else{hide("mstatus-err");}\n'
+        '    renderModelState(d);\n'
         '    setJson("mstatus-pre",d);show("mstatus-result");\n'
-        '  }catch(e){setText("mstatus-msg","fetch error: "+e);}finally{hide("mstatus-spin");}\n'
+        '  }catch(e){setText("mstatus-msg","fetch error: "+e);}\n'
+        '  finally{hide("mstatus-spin");}\n'
         '}\n'
         'function toggleMStatusPoll(){\n'
         '  if(document.getElementById("mstatus-auto").checked){\n'
@@ -1310,11 +1442,8 @@ def browser_ui():
         '    const r=await fetch(B+"/model/pull",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({force:force})});\n'
         '    const d=await r.json();\n'
         '    setJson("pull-pre",d);\n'
-        '    badge(document.getElementById("pull-badge"),d.state||"?",bc(d.state));\n'
-        '    setText("pull-msg",d.message||"");\n'
-        '    renderProgress("pull",d);\n'
-        '    if(d.state==="in_progress"){show("pull-progress");startPullPoll();}else{hide("pull-progress");hide("pull-progress-text");}\n'
-        '    if(d.state==="error"&&d.error){setText("pull-err",d.error);show("pull-err");}\n'
+        '    renderModelState(d);\n'
+        '    if(d.state==="in_progress"){startPullPoll();}\n'
         '  }catch(e){setText("pull-err","Request failed: "+e);show("pull-err");}\n'
         '  finally{hide("pull-spin");document.getElementById("btn-pull").disabled=false;}\n'
         '}\n'
@@ -1324,7 +1453,7 @@ def browser_ui():
         '}\n'
         'function stopPullPoll(){\n'
         '  if(_pullPollTimer){clearInterval(_pullPollTimer);_pullPollTimer=null;}\n'
-        '  hide("pull-poll-status");hide("pull-progress");hide("pull-progress-text");\n'
+        '  hide("pull-poll-status");\n'
         '}\n'
         'async function doPullPoll(){\n'
         '  const elapsed=_pullStart?((Date.now()-_pullStart)/1000).toFixed(0)+"s":"?";\n'
@@ -1332,13 +1461,9 @@ def browser_ui():
         '  try{\n'
         '    const r=await fetch(B+"/model/status");const d=await r.json();\n'
         '    const s=d.state||"unknown";\n'
-        '    badge(document.getElementById("pull-badge"),s,bc(s));\n'
-        '    setText("pull-msg",d.message||"");\n'
-        '    renderProgress("pull",d);\n'
+        '    renderModelState(d);\n'
         '    setJson("pull-status-pre",d);show("pull-status-details");\n'
         '    if(s==="ready"||s==="error"||s==="not_started"||s==="stalled"){stopPullPoll();}\n'
-        '    if(s==="error"&&d.error){setText("pull-err",d.error);show("pull-err");}\n'
-        '    else{hide("pull-err");}\n'
         '  }catch(e){/* keep polling */}\n'
         '}\n'
         '\n'
@@ -1356,54 +1481,88 @@ def browser_ui():
         '  rd.readAsText(f);\n'
         '});\n'
         'let _lastImgs=[];\n'
+        'let _genPollTimer=null;\n'
+        'function stopGeneratePoll(){if(_genPollTimer){clearTimeout(_genPollTimer);_genPollTimer=null;}}\n'
+        'function setGenerateActive(active){document.getElementById("btn-gen").disabled=active;document.getElementById("btn-gen-stop").disabled=!active;if(active)show("gen-spin");else hide("gen-spin");}\n'
+        'function renderGenerateStatus(d){\n'
+        '  show("gen-status");\n'
+        '  const s=d.state||"unknown";\n'
+        '  badge(document.getElementById("gen-badge"),s,bc(s));\n'
+        '  setText("gen-msg",d.message||"");\n'
+        '  const bar=document.getElementById("gen-progress");\n'
+        '  const fill=document.getElementById("gen-progress-fill");\n'
+        '  const txt=document.getElementById("gen-progress-text");\n'
+        '  if(s==="in_progress"){\n'
+        '    bar.classList.remove("hidden");txt.classList.remove("hidden");\n'
+        '    if(d.total_steps&&d.total_steps>0){\n'
+        '      const pct=Math.max(0,Math.min(100,Number(d.percent||0)));\n'
+        '      fill.classList.remove("pulse");fill.style.width=pct+"%";\n'
+        '      const img=(d.image_count?Number(d.image_index||0)+1:0)+"/"+(d.image_count||0);\n'
+        '      txt.textContent=Math.round(pct)+"% · step "+(d.step||0)+"/"+d.total_steps+" · image "+img+(d.phase?" · "+d.phase:"");\n'
+        '    }else{fill.classList.add("pulse");fill.style.width="35%";txt.textContent="Generating…";}\n'
+        '  }else if(s==="ready"){\n'
+        '    bar.classList.remove("hidden");txt.classList.remove("hidden");fill.classList.remove("pulse");fill.style.width="100%";txt.textContent="100% · complete";\n'
+        '  }else if(s==="cancelled"){\n'
+        '    bar.classList.remove("hidden");txt.classList.remove("hidden");fill.classList.remove("pulse");fill.style.width=Math.max(0,Math.min(100,Number(d.percent||0)))+"%";txt.textContent="Generation cancelled";\n'
+        '  }\n'
+        '}\n'
         'async function callGenerate(){\n'
         '  const btn=document.getElementById("btn-gen");\n'
-        '  btn.disabled=true;show("gen-spin");hide("gen-err");hide("gen-resp");hide("btn-dl-all");\n'
+        '  stopGeneratePoll();setGenerateActive(true);hide("gen-err");hide("gen-resp");hide("btn-dl-all");hide("gen-status");hide("gen-progress");hide("gen-progress-text");\n'
         '  document.getElementById("gen-imgs").innerHTML="";\n'
         '  _lastImgs=[];\n'
         '  let body;\n'
         '  const isPrompt=document.getElementById("tp-prompt").classList.contains("on");\n'
         '  if(isPrompt){\n'
         '    const p=document.getElementById("p-prompt").value.trim();\n'
-        '    if(!p){const e=document.getElementById("gen-err");e.textContent="Prompt is required.";e.classList.remove("hidden");btn.disabled=false;hide("gen-spin");return;}\n'
+        '    if(!p){const e=document.getElementById("gen-err");e.textContent="Prompt is required.";e.classList.remove("hidden");setGenerateActive(false);return;}\n'
         '    const po={prompt:p};\n'
         '    const neg=document.getElementById("p-neg").value.trim();if(neg)po.negative_prompt=neg;\n'
         '    const seed=document.getElementById("p-seed").value.trim();if(seed)po.seed=parseInt(seed,10);\n'
         '    body={prompts:[po],steps:parseInt(document.getElementById("p-steps").value,10)||20,guidance:parseFloat(document.getElementById("p-guidance").value)||7.5,width:parseInt(document.getElementById("p-width").value,10)||512,height:parseInt(document.getElementById("p-height").value,10)||512,refine:document.getElementById("p-refine").checked,cpu:document.getElementById("p-cpu").checked};\n'
         '  }else{\n'
         '    const raw=document.getElementById("b-json").value.trim();\n'
-        '    if(!raw){const e=document.getElementById("gen-err");e.textContent="Paste or upload a batch JSON file.";e.classList.remove("hidden");btn.disabled=false;hide("gen-spin");return;}\n'
-        '    try{body=JSON.parse(raw);}catch(ex){const e=document.getElementById("gen-err");e.textContent="Invalid JSON: "+ex.message;e.classList.remove("hidden");btn.disabled=false;hide("gen-spin");return;}\n'
+        '    if(!raw){const e=document.getElementById("gen-err");e.textContent="Paste or upload a batch JSON file.";e.classList.remove("hidden");setGenerateActive(false);return;}\n'
+        '    try{body=JSON.parse(raw);}catch(ex){const e=document.getElementById("gen-err");e.textContent="Invalid JSON: "+ex.message;e.classList.remove("hidden");setGenerateActive(false);return;}\n'
         '  }\n'
         '  try{\n'
         '    const r=await fetch(B+"/generate/async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});\n'
         '    const d=await r.json();\n'
         '    if(r.status>=400||d.state==="error"){\n'
         '      const e=document.getElementById("gen-err");e.textContent="Server error: "+(d.error||JSON.stringify(d));e.classList.remove("hidden");\n'
-        '      btn.disabled=false;hide("gen-spin");return;\n'
+        '      setGenerateActive(false);return;\n'
         '    }\n'
+        '    renderGenerateStatus(d);\n'
         '    pollGenerate();\n'
-        '  }catch(e){const el=document.getElementById("gen-err");el.textContent="Request failed: "+e;el.classList.remove("hidden");btn.disabled=false;hide("gen-spin");}\n'
+        '  }catch(e){const el=document.getElementById("gen-err");el.textContent="Request failed: "+e;el.classList.remove("hidden");setGenerateActive(false);}\n'
+        '}\n'
+        'async function callGenerateCancel(){\n'
+        '  stopGeneratePoll();setGenerateActive(false);\n'
+        '  try{const r=await fetch(B+"/generate/cancel",{method:"POST"});const d=await r.json();renderGenerateStatus({state:"cancelled",message:d.message||"Generation cancellation requested.",percent:0});}\n'
+        '  catch(e){const el=document.getElementById("gen-err");el.textContent="Cancel failed: "+e;el.classList.remove("hidden");}\n'
         '}\n'
         'async function pollGenerate(){\n'
+        '  stopGeneratePoll();\n'
         '  try{\n'
         '    const r=await fetch(B+"/generate/status");\n'
         '    const d=await r.json();\n'
-        '    if(d.state==="in_progress"){setTimeout(pollGenerate,3000);return;}\n'
-        '    const btn=document.getElementById("btn-gen");btn.disabled=false;hide("gen-spin");\n'
+        '    renderGenerateStatus(d);\n'
+        '    if(d.state==="in_progress"){_genPollTimer=setTimeout(pollGenerate,3000);return;}\n'
+        '    stopGeneratePoll();setGenerateActive(false);\n'
         '    const disp=Object.assign({},d);\n'
         '    if(Array.isArray(d.results)){disp.results=d.results.map(x=>{const c=Object.assign({},x);if(c.image_base64)c.image_base64="["+c.image_base64.length+" b64 chars]";return c;});}\n'
         '    setJson("gen-pre",disp);\n'
         '    const lbl=document.getElementById("gen-resp-label");\n'
-        '    lbl.textContent="JSON response ("+d.state+(d.device?" \u00b7 "+d.device:"")+(d.elapsed_seconds?" \u00b7 "+Math.round(d.elapsed_seconds)+"s":"")+")";\n'
+        '    lbl.textContent="JSON response ("+d.state+(d.device?" · "+d.device:"")+(d.elapsed_seconds?" · "+Math.round(d.elapsed_seconds)+"s":"")+")";\n'
         '    show("gen-resp");\n'
         '    if(d.state==="error"){\n'
         '      const e=document.getElementById("gen-err");e.textContent="Server error: "+(d.error||JSON.stringify(d));e.classList.remove("hidden");return;\n'
         '    }\n'
+        '    if(d.state==="cancelled"){return;}\n'
         '    _lastImgs=d.results||[];\n'
         '    renderImages(_lastImgs);\n'
         '    if(_lastImgs.some(x=>x.image_base64))show("btn-dl-all");\n'
-        '  }catch(e){const btn=document.getElementById("btn-gen");btn.disabled=false;hide("gen-spin");const el=document.getElementById("gen-err");el.textContent="Status poll failed: "+e;el.classList.remove("hidden");}\n'
+        '  }catch(e){stopGeneratePoll();setGenerateActive(false);const el=document.getElementById("gen-err");el.textContent="Status poll failed: "+e;el.classList.remove("hidden");}\n'
         '}\n'
         'function renderImages(results){\n'
         '  const c=document.getElementById("gen-imgs");c.innerHTML="";\n'
@@ -1467,9 +1626,10 @@ def root():
             "GET /health": "Health check",
             "POST /generate": "Generate images synchronously (returns images inline; may exceed cloud ingress timeouts on CPU)",
             "POST /generate/async": "Start background generation (returns 202); poll GET /generate/status",
-            "GET /generate/status": "Poll async generation state: idle | in_progress | ready | error",
+            "POST /generate/cancel": "Request cancellation of async generation",
+            "GET /generate/status": "Poll async generation state: idle | in_progress | ready | error | cancelled",
             "POST /model/pull": "Start async model download/warm-up (returns 202)",
-            "GET /model/status": "Poll model warm-up state and durable cache progress"
+            "GET /model/status": "Poll model warm-up state and cache presence"
         },
         "documentation": "POST /generate with JSON batch config containing 'prompts' array"
     }), 200
