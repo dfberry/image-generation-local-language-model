@@ -51,6 +51,11 @@ class OOMError(RuntimeError):
     pass
 
 
+class GenerationCancelled(Exception):
+    """Raised when an in-flight generation is cancelled cooperatively."""
+    pass
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Generate images with Stable Diffusion XL",
@@ -157,7 +162,7 @@ def load_refiner(text_encoder_2, vae, device: str) -> DiffusionPipeline:
     return refiner
 
 
-def generate(args) -> str:
+def generate(args, progress_callback=None, cancel_check=None) -> str:
     """Run image generation and save to output path."""
     device = get_device(args.cpu)
     negative_prompt = getattr(args, "negative_prompt", None)
@@ -188,6 +193,19 @@ def generate(args) -> str:
 
     # Base+refiner split: 80% of steps on base, 20% on refiner
     high_noise_frac = 0.8
+    completed_steps = 0
+
+    def _make_step_callback(phase: str):
+        def _cb(pipe, step_index, timestep, callback_kwargs):
+            nonlocal completed_steps
+            completed_steps += 1
+            reported = min(completed_steps, args.steps)
+            if progress_callback is not None:
+                progress_callback(reported, args.steps, phase)
+            if cancel_check is not None and cancel_check():
+                raise GenerationCancelled("cancelled by user")
+            return callback_kwargs
+        return _cb
 
     base = refiner = latents = text_encoder_2 = vae = image = None
     try:
@@ -206,6 +224,8 @@ def generate(args) -> str:
                 denoising_end=high_noise_frac,
                 output_type="latent",
                 generator=generator,
+                callback_on_step_end=_make_step_callback("base"),
+                callback_on_step_end_tensor_inputs=["latents"],
             ).images
 
             # Extract shared components before freeing base from GPU
@@ -235,6 +255,8 @@ def generate(args) -> str:
                 # Move latents back to device for refiner inference.
                 image=latents.to(device) if device in ("cuda", "mps") else latents,
                 generator=generator,
+                callback_on_step_end=_make_step_callback("refine"),
+                callback_on_step_end_tensor_inputs=["latents"],
             ).images[0]
         else:
             print(f"🎨 Running base model ({args.steps} steps)...")
@@ -247,6 +269,8 @@ def generate(args) -> str:
                 width=args.width,
                 height=args.height,
                 generator=generator,
+                callback_on_step_end=_make_step_callback("base"),
+                callback_on_step_end_tensor_inputs=["latents"],
             ).images[0]
 
         if image is not None:
@@ -291,10 +315,15 @@ def run_batch(
     refine: bool = False,
     cpu: bool = False,
     negative_prompt: str | None = None,
+    progress_callback=None,
+    cancel_check=None,
+    item_callback=None,
 ) -> list[dict]:
     """Generate a batch using the Flask API parameter shape."""
     results = []
-    for item in prompts:
+    for i, item in enumerate(prompts):
+        if item_callback is not None:
+            item_callback(i)
         args = SimpleNamespace(
             prompt=item["prompt"],
             negative_prompt=item.get("negative_prompt", negative_prompt),
@@ -308,13 +337,19 @@ def run_batch(
             cpu=cpu,
         )
         try:
-            output_path = generate_with_retry(args)
+            output_path = generate_with_retry(
+                args,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
             results.append({
                 "prompt": item["prompt"],
                 "output": output_path,
                 "status": "ok",
                 "error": None,
             })
+        except GenerationCancelled:
+            raise
         except Exception as exc:
             results.append({
                 "prompt": item["prompt"],
@@ -377,7 +412,7 @@ def batch_generate(
     return results
 
 
-def generate_with_retry(args, max_retries: int = 2) -> str:
+def generate_with_retry(args, max_retries: int = 2, progress_callback=None, cancel_check=None) -> str:
     """
     Wraps generate(args) with OOM retry logic.
     - On OOMError: halves args.steps (floor at 1), prints warning, retries
@@ -387,7 +422,13 @@ def generate_with_retry(args, max_retries: int = 2) -> str:
     """
     for attempt in range(max_retries + 1):
         try:
-            return generate(args)
+            return generate(
+                args,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
+        except GenerationCancelled:
+            raise
         except OOMError:
             if attempt == max_retries:
                 raise OOMError(
