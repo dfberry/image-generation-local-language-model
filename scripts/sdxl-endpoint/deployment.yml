@@ -1,0 +1,33 @@
+$schema: https://azuremlschemas.azureedge.net/latest/managedOnlineDeployment.schema.json
+name: blue
+endpoint_name: sdxl-image-endpoint
+model:
+  name: sdxl-hf-model
+  version: "1"
+  path: ./model
+  type: custom_model
+environment:
+  name: sdxl-diffusers-cuda
+  image: mcr.microsoft.com/azureml/curated/acpt-pytorch-2.2-cuda12.1:latest
+  conda_file: conda.yaml
+code_configuration:
+  code: .
+  scoring_script: score.py
+instance_type: Standard_NC6s_v3
+instance_count: 1
+environment_variables:
+  SDXL_MODEL_NAME: stabilityai/stable-diffusion-xl-base-1.0
+  SDXL_MODEL_REVISION: main
+request_settings:
+  request_timeout_ms: 180000
+  max_concurrent_requests_per_instance: 1
+liveness_probe:
+  initial_delay: 600
+  period: 30
+  timeout: 20
+  failure_threshold: 10
+readiness_probe:
+  initial_delay: 600
+  period: 30
+  timeout: 20
+  failure_threshold: 10

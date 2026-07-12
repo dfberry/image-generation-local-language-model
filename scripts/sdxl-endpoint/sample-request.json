@@ -1,0 +1,9 @@
+{
+  "prompt": "A watercolor painting of a friendly robot painting a sunset over the Pacific Northwest",
+  "negative_prompt": "blurry, low quality, distorted",
+  "steps": 30,
+  "guidance": 7.5,
+  "width": 1024,
+  "height": 1024,
+  "seed": 12345
+}
