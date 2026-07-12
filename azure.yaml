@@ -25,11 +25,9 @@ hooks:
   # via the services.api.docker block above. A manual docker build here was
   # redundant and would re-tag with :latest instead of azd's deploy tag.
   #
-  # postdeploy: after the app is live, land the model on the Azure Files share
-  # by calling the app's async /model/pull and blocking until /model/status is
-  # "ready". This runs at deploy time (not provision) because the app must be
-  # running to populate the share via its SMB-safe download logic. The URL comes
-  # from the `containerAppUrl` infra output, exposed to hooks as an env var.
+  # postdeploy: keep azd up short and non-blocking. The hook prints the service
+  # URL and one-line instructions for triggering POST /model/pull and polling
+  # GET /model/status; it does not wait for the model cache to warm.
   postdeploy:
     continueOnError: true
     posix:
