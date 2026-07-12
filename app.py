@@ -11,7 +11,7 @@ Endpoints:
   POST /generate/async - Start background generation; returns 202 immediately
   GET  /generate/status - Poll generation state: idle | in_progress | ready | error
   POST /model/pull   - Kick off async model download/warm-up; returns 202 immediately
-  GET  /model/status - Poll warm-up state: not_started | in_progress | ready | error
+  GET  /model/status - Poll warm-up state: not_started | in_progress | ready | error | stalled
 
 CORS: permissive (Access-Control-Allow-Origin: *) on all routes so the API
 can be called from any browser origin or from the / (UI) page itself.
@@ -22,6 +22,7 @@ import gc
 import json
 import logging
 import os
+import tempfile
 import threading
 from typing import Any, Optional
 
@@ -63,33 +64,327 @@ def _options_preflight(path):
 # ---------------------------------------------------------------------------
 # Model warm-up state
 # ---------------------------------------------------------------------------
+BASE_MODEL_CACHE_DIR = "models--stabilityai--stable-diffusion-xl-base-1.0"
+PROGRESS_FILE_NAME = ".pull-progress.json"
+PULL_STALE_AFTER_SECONDS = 120
+PULL_HEARTBEAT_SECONDS = 5
+BASE_MODEL_EXPECTED_BYTES = int(os.environ.get(
+    "SDXL_BASE_MODEL_EXPECTED_BYTES", str(7 * 1024 * 1024 * 1024)
+))
+BASE_MODEL_READY_MIN_BYTES = int(os.environ.get(
+    "SDXL_BASE_MODEL_READY_MIN_BYTES", str(5 * 1024 * 1024 * 1024)
+))
+
 _model_state_lock = threading.Lock()
 _model_state: dict = {
     "state": "not_started",   # not_started | in_progress | ready | error
     "message": "Model has not been pulled yet.",
+    "bytes_downloaded": 0,
+    "bytes_expected": BASE_MODEL_EXPECTED_BYTES,
+    "percent": 0.0,
     "started_at": None,
+    "last_updated": None,
     "finished_at": None,
     "elapsed_seconds": None,
     "error": None,
+    "cache_path": None,
+    "revision": os.environ.get("SDXL_MODEL_REVISION") or None,
 }
+_model_pull_thread: Optional[threading.Thread] = None
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso(dt: Optional[datetime]) -> Optional[str]:
+    return dt.isoformat() if dt else None
+
+
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+
+def get_hf_cache_root() -> str:
+    """Return the HF cache root used by DiffusionPipeline.from_pretrained."""
+    return os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+
+
+def get_hf_hub_cache_dir(cache_root: Optional[str] = None) -> str:
+    """Return the Hugging Face hub cache directory beneath the HF cache root."""
+    return os.environ.get("HF_HUB_CACHE") or os.path.join(
+        cache_root or get_hf_cache_root(), "hub"
+    )
+
+
+def get_base_model_cache_path(cache_root: Optional[str] = None) -> str:
+    return os.path.join(
+        get_hf_hub_cache_dir(cache_root), BASE_MODEL_CACHE_DIR
+    )
+
+
+def get_pull_progress_path(cache_root: Optional[str] = None) -> str:
+    return os.path.join(cache_root or get_hf_cache_root(), PROGRESS_FILE_NAME)
+
+
+def _safe_dir_size(path: str) -> int:
+    total = 0
+    if not os.path.isdir(path):
+        return 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                continue
+    return total
+
+
+def _calculate_percent(bytes_downloaded: Optional[int], bytes_expected: Optional[int]) -> Optional[float]:
+    if not bytes_downloaded or not bytes_expected or bytes_expected <= 0:
+        return None
+    return round(min(100.0, (bytes_downloaded / bytes_expected) * 100.0), 2)
+
+
+def _progress_payload(
+    state: str,
+    message: str,
+    *,
+    started_at: Optional[datetime] = None,
+    finished_at: Optional[datetime] = None,
+    error: Optional[str] = None,
+    cache_root: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> dict:
+    now = now or _utc_now()
+    cache_root = cache_root or get_hf_cache_root()
+    cache_path = get_base_model_cache_path(cache_root)
+    bytes_downloaded = _safe_dir_size(cache_path)
+    bytes_expected = BASE_MODEL_EXPECTED_BYTES
+    started_iso = _iso(started_at)
+    finished_iso = _iso(finished_at)
+    elapsed_seconds = None
+    if started_at is not None:
+        end = finished_at or now
+        elapsed_seconds = (end - started_at).total_seconds()
+    return {
+        "state": state,
+        "message": message,
+        "bytes_downloaded": bytes_downloaded,
+        "bytes_expected": bytes_expected,
+        "percent": _calculate_percent(bytes_downloaded, bytes_expected),
+        "started_at": started_iso,
+        "last_updated": _iso(now),
+        "finished_at": finished_iso,
+        "elapsed_seconds": elapsed_seconds,
+        "error": error,
+        "cache_path": cache_path,
+        "revision": os.environ.get("SDXL_MODEL_REVISION") or None,
+    }
+
+
+def _write_progress_file(payload: dict, cache_root: Optional[str] = None) -> None:
+    cache_root = cache_root or get_hf_cache_root()
+    os.makedirs(cache_root, exist_ok=True)
+    progress_path = get_pull_progress_path(cache_root)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f"{PROGRESS_FILE_NAME}.", suffix=".tmp", dir=cache_root
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, progress_path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _safe_write_progress(payload: dict) -> None:
+    try:
+        _write_progress_file(payload)
+    except Exception as exc:
+        logger.warning("model/pull: could not write durable progress: %s", exc)
+
+
+def _read_progress_file(cache_root: Optional[str] = None) -> Optional[dict]:
+    progress_path = get_pull_progress_path(cache_root)
+    try:
+        with open(progress_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def is_base_model_cache_present(
+    cache_root: Optional[str] = None,
+    *,
+    min_ready_bytes: int = BASE_MODEL_READY_MIN_BYTES,
+) -> bool:
+    model_path = get_base_model_cache_path(cache_root)
+    snapshots_path = os.path.join(model_path, "snapshots")
+    if not os.path.isdir(snapshots_path):
+        return False
+    has_snapshot = False
+    try:
+        for entry in os.scandir(snapshots_path):
+            if entry.is_dir():
+                has_snapshot = True
+                break
+    except OSError:
+        return False
+    if not has_snapshot:
+        return False
+    return _safe_dir_size(model_path) >= min_ready_bytes
+
+
+def _is_model_pull_worker_alive() -> bool:
+    with _model_state_lock:
+        return _model_pull_thread is not None and _model_pull_thread.is_alive()
+
+
+def reconcile_model_status(
+    *,
+    cache_root: Optional[str] = None,
+    active_worker: bool = False,
+    now: Optional[datetime] = None,
+    stale_after_seconds: int = PULL_STALE_AFTER_SECONDS,
+    min_ready_bytes: int = BASE_MODEL_READY_MIN_BYTES,
+) -> dict:
+    """Reconcile durable progress with the actual HF cache on disk."""
+    now = now or _utc_now()
+    cache_root = cache_root or get_hf_cache_root()
+    cache_path = get_base_model_cache_path(cache_root)
+
+    with _model_state_lock:
+        base = dict(_model_state)
+    progress = _read_progress_file(cache_root)
+    if progress:
+        base.update(progress)
+
+    bytes_downloaded = _safe_dir_size(cache_path)
+    bytes_expected = base.get("bytes_expected") or BASE_MODEL_EXPECTED_BYTES
+    base["bytes_downloaded"] = bytes_downloaded
+    base["bytes_expected"] = bytes_expected
+    base["percent"] = _calculate_percent(bytes_downloaded, bytes_expected)
+    base.setdefault("last_updated", None)
+    base.setdefault("finished_at", None)
+    base.setdefault("elapsed_seconds", None)
+    base.setdefault("error", None)
+    base.setdefault("revision", os.environ.get("SDXL_MODEL_REVISION") or None)
+    base["cache_path"] = cache_path
+
+    model_present = is_base_model_cache_present(
+        cache_root, min_ready_bytes=min_ready_bytes
+    )
+    if model_present and not active_worker:
+        base.update({
+            "state": "ready",
+            "message": "Model weights are present on the HF cache share.",
+            "bytes_downloaded": _safe_dir_size(cache_path),
+            "bytes_expected": BASE_MODEL_EXPECTED_BYTES,
+            "finished_at": base.get("finished_at") or base.get("last_updated"),
+            "error": None,
+        })
+        base["percent"] = _calculate_percent(
+            base.get("bytes_downloaded"), base.get("bytes_expected")
+        )
+    elif base.get("state") == "ready" and not model_present:
+        base.update({
+            "state": "not_started",
+            "message": "Model cache is not present on the HF cache share.",
+            "finished_at": None,
+            "elapsed_seconds": None,
+            "error": None,
+        })
+    elif base.get("state") == "in_progress" and not active_worker:
+        last_updated = _parse_iso_datetime(base.get("last_updated"))
+        age = (
+            (now - last_updated).total_seconds()
+            if last_updated
+            else stale_after_seconds + 1
+        )
+        if age > stale_after_seconds:
+            base.update({
+                "state": "stalled",
+                "message": (
+                    "Model pull progress is stale. Trigger POST /model/pull "
+                    "again or check container logs."
+                ),
+                "error": None,
+            })
+
+    started = _parse_iso_datetime(base.get("started_at"))
+    finished = _parse_iso_datetime(base.get("finished_at"))
+    if started and base.get("elapsed_seconds") is None:
+        base["elapsed_seconds"] = ((finished or now) - started).total_seconds()
+
+    base["timestamp"] = _iso(now)
+    return base
+
+
+def _heartbeat_pull_progress(stop_event: threading.Event, started: datetime, device: str) -> None:
+    while not stop_event.wait(PULL_HEARTBEAT_SECONDS):
+        payload = _progress_payload(
+            "in_progress",
+            f"Downloading/loading model on device '{device}'…",
+            started_at=started,
+        )
+        _safe_write_progress(payload)
+
+
+def _stop_pull_heartbeat(stop_event: threading.Event, heartbeat: threading.Thread) -> None:
+    stop_event.set()
+    heartbeat.join(timeout=1)
 
 
 def _pull_worker() -> None:
     """Background thread: loads the base model to warm the on-disk HF cache."""
     device = get_device()
-    started = datetime.now(timezone.utc)
+    started = _utc_now()
 
     with _model_state_lock:
         _model_state.update({
             "state": "in_progress",
             "message": f"Downloading/loading model on device '{device}'…",
-            "started_at": started.isoformat(),
+            "started_at": _iso(started),
+            "last_updated": _iso(started),
             "finished_at": None,
             "elapsed_seconds": None,
             "error": None,
         })
 
+    _safe_write_progress(_progress_payload(
+        "in_progress",
+        f"Downloading/loading model on device '{device}'…",
+        started_at=started,
+        now=started,
+    ))
     logger.info("model/pull: starting load_base() to warm HF disk cache")
+    heartbeat_stop = threading.Event()
+    heartbeat = threading.Thread(
+        target=_heartbeat_pull_progress,
+        args=(heartbeat_stop, started, device),
+        daemon=True,
+        name="model-pull-heartbeat",
+    )
+    heartbeat.start()
 
     try:
         pipe = load_base(device)
@@ -100,33 +395,54 @@ def _pull_worker() -> None:
         del pipe
         gc.collect()
 
-        finished = datetime.now(timezone.utc)
+        finished = _utc_now()
         elapsed = (finished - started).total_seconds()
         logger.info(f"model/pull: done in {elapsed:.1f}s; in-memory pipeline released")
+        _stop_pull_heartbeat(heartbeat_stop, heartbeat)
 
         with _model_state_lock:
             _model_state.update({
                 "state": "ready",
                 "message": "Model weights cached on disk. /generate will load from cache.",
-                "finished_at": finished.isoformat(),
+                "last_updated": _iso(finished),
+                "finished_at": _iso(finished),
                 "elapsed_seconds": elapsed,
                 "error": None,
             })
+        _safe_write_progress(_progress_payload(
+            "ready",
+            "Model weights cached on disk. /generate will load from cache.",
+            started_at=started,
+            finished_at=finished,
+            now=finished,
+        ))
 
     except (OOMError, Exception) as exc:
-        finished = datetime.now(timezone.utc)
+        finished = _utc_now()
         elapsed = (finished - started).total_seconds()
         msg = str(exc)
         logger.error(f"model/pull: failed after {elapsed:.1f}s — {msg}", exc_info=True)
+        _stop_pull_heartbeat(heartbeat_stop, heartbeat)
 
         with _model_state_lock:
             _model_state.update({
                 "state": "error",
                 "message": "Model pull failed. See 'error' field.",
-                "finished_at": finished.isoformat(),
+                "last_updated": _iso(finished),
+                "finished_at": _iso(finished),
                 "elapsed_seconds": elapsed,
                 "error": msg,
             })
+        _safe_write_progress(_progress_payload(
+            "error",
+            "Model pull failed. See 'error' field.",
+            started_at=started,
+            finished_at=finished,
+            error=msg,
+            now=finished,
+        ))
+    finally:
+        _stop_pull_heartbeat(heartbeat_stop, heartbeat)
 
 
 # ---------------------------------------------------------------------------
@@ -484,49 +800,65 @@ def model_pull():
     Optional JSON body: {"force": true} — re-pull even if state is already "ready".
 
     Response:
-        { "state": "in_progress"|"ready"|"error"|"not_started",
+        { "state": "in_progress"|"ready"|"error"|"not_started"|"stalled",
           "message": "...", "timestamp": "..." }
     """
+    global _model_pull_thread
+
     body = request.get_json(silent=True) or {}
     force = bool(body.get("force", False))
+    active_worker = _is_model_pull_worker_alive()
+    reconciled = reconcile_model_status(active_worker=active_worker)
 
     with _model_state_lock:
-        current_state = _model_state["state"]
+        current_state = reconciled["state"]
 
-        if current_state == "in_progress":
-            return jsonify({
-                "state": "in_progress",
-                "message": "Pull already in progress.",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }), 202
+        if active_worker or (current_state == "in_progress" and not force):
+            reconciled["message"] = "Pull already in progress."
+            return jsonify(reconciled), 202
 
         if current_state == "ready" and not force:
-            return jsonify({
-                "state": "ready",
-                "message": "Model is already cached. Pass {\"force\": true} to re-pull.",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }), 200
+            reconciled["message"] = (
+                "Model is already cached. Pass {\"force\": true} to re-pull."
+            )
+            return jsonify(reconciled), 200
 
         # Transition to in_progress synchronously (inside the lock) so a
         # concurrent caller sees the right state before the thread starts.
+        started = _utc_now()
+        bytes_downloaded = _safe_dir_size(get_base_model_cache_path())
         _model_state.update({
             "state": "in_progress",
             "message": "Pull started.",
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "bytes_downloaded": bytes_downloaded,
+            "bytes_expected": BASE_MODEL_EXPECTED_BYTES,
+            "percent": _calculate_percent(
+                bytes_downloaded, BASE_MODEL_EXPECTED_BYTES
+            ),
+            "started_at": _iso(started),
+            "last_updated": _iso(started),
             "finished_at": None,
             "elapsed_seconds": None,
             "error": None,
+            "cache_path": get_base_model_cache_path(),
+            "revision": os.environ.get("SDXL_MODEL_REVISION") or None,
         })
 
+    _safe_write_progress(_progress_payload(
+        "in_progress",
+        "Pull started.",
+        started_at=started,
+        now=started,
+    ))
     thread = threading.Thread(target=_pull_worker, daemon=True, name="model-pull")
+    with _model_state_lock:
+        _model_pull_thread = thread
     thread.start()
     logger.info("model/pull: background thread launched")
 
-    return jsonify({
-        "state": "in_progress",
-        "message": "Model pull started in background. Poll GET /model/status.",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }), 202
+    snapshot = reconcile_model_status(active_worker=True)
+    snapshot["message"] = "Model pull started in background. Poll GET /model/status."
+    return jsonify(snapshot), 202
 
 
 @app.route("/model/status", methods=["GET"])
@@ -537,24 +869,23 @@ def model_status():
     Returns the current model warm-up state.
 
     Response (always HTTP 200):
-        { "state": "not_started"|"in_progress"|"ready"|"error",
+        { "state": "not_started"|"in_progress"|"ready"|"error"|"stalled",
           "message": "...",
+          "bytes_downloaded": <number>,
+          "bytes_expected": <number|null>,
+          "percent": <number|null>,
           "started_at": "<ISO8601 or null>",
+          "last_updated": "<ISO8601 or null>",
           "finished_at": "<ISO8601 or null>",
           "elapsed_seconds": <number or null>,
           "error": "<string or null>",
+          "cache_path": "<string>",
+          "revision": "<string or null>",
           "device": "cuda|mps|cpu",
           "timestamp": "<ISO8601>" }
     """
-    with _model_state_lock:
-        snapshot = dict(_model_state)
-
+    snapshot = reconcile_model_status(active_worker=_is_model_pull_worker_alive())
     snapshot["device"] = get_device()
-    snapshot["timestamp"] = datetime.now(timezone.utc).isoformat()
-
-    # Only include "error" key when state is error
-    if snapshot["state"] != "error":
-        snapshot.pop("error", None)
 
     return jsonify(snapshot), 200
 
@@ -703,7 +1034,8 @@ def browser_ui():
         '.elapsed{font-size:.72rem;color:#71717a}\n'
         '.err-box{background:#450a0a;border:1px solid #7f1d1d;border-radius:6px;padding:.6rem;font-size:.82rem;color:#fca5a5;margin-top:.4rem}\n'
         '.progress{width:100%;height:3px;background:#27272a;border-radius:2px;margin-top:.5rem}\n'
-        '.progress-fill{height:100%;background:#7c3aed;border-radius:2px;animation:pulse-width 2s ease-in-out infinite}\n'
+        '.progress-fill{height:100%;background:#7c3aed;border-radius:2px;width:0;transition:width .2s}\n'
+        '.progress-fill.pulse{animation:pulse-width 2s ease-in-out infinite}\n'
         '@keyframes pulse-width{0%{width:15%}50%{width:75%}100%{width:15%}}\n'
         '.tabs{display:flex;border-bottom:1px solid #2d2d40;margin-bottom:.75rem}\n'
         '.tab{padding:.4rem .9rem;cursor:pointer;font-size:.82rem;font-weight:500;color:#71717a;border-bottom:2px solid transparent;margin-bottom:-1px}\n'
@@ -777,6 +1109,8 @@ def browser_ui():
         '      <span id="mstatus-msg" style="font-size:.82rem;color:#94a3b8"></span>\n'
         '      <span class="elapsed" id="mstatus-elapsed"></span>\n'
         '    </div>\n'
+        '    <div id="mstatus-progress" class="progress hidden"><div id="mstatus-progress-fill" class="progress-fill"></div></div>\n'
+        '    <div id="mstatus-progress-text" class="elapsed hidden" style="margin-top:.35rem"></div>\n'
         '    <div id="mstatus-err" class="err-box hidden"></div>\n'
         '    <details><summary>JSON response</summary><pre id="mstatus-pre"></pre></details>\n'
         '  </div>\n'
@@ -800,7 +1134,8 @@ def browser_ui():
         '      <span class="badge grey" id="pull-badge">—</span>\n'
         '      <span id="pull-msg" style="font-size:.82rem;color:#94a3b8"></span>\n'
         '    </div>\n'
-        '    <div id="pull-progress" class="progress hidden"><div class="progress-fill"></div></div>\n'
+        '    <div id="pull-progress" class="progress hidden"><div id="pull-progress-fill" class="progress-fill pulse"></div></div>\n'
+        '    <div id="pull-progress-text" class="elapsed hidden" style="margin-top:.35rem"></div>\n'
         '    <div id="pull-poll-status" class="status-row hidden" style="margin-top:.5rem">\n'
         '      <span class="spinner"></span>\n'
         '      <span style="font-size:.78rem;color:#71717a">Polling /model/status…</span>\n'
@@ -872,7 +1207,7 @@ def browser_ui():
         'const B="";\n'
         '\n'
         '// helpers\n'
-        'function bc(s){if(s==="healthy"||s==="ready"||s==="ok")return"ok";if(s==="in_progress")return"info";if(s==="error")return"err";if(s==="not_started")return"grey";return"warn";}\n'
+        'function bc(s){if(s==="healthy"||s==="ready"||s==="ok")return"ok";if(s==="in_progress")return"info";if(s==="error")return"err";if(s==="not_started")return"grey";if(s==="stalled")return"warn";return"warn";}\n'
         'function badge(el,txt,cls){el.textContent=txt;el.className="badge "+cls;}\n'
         'function show(id){document.getElementById(id).classList.remove("hidden");}\n'
         'function hide(id){document.getElementById(id).classList.add("hidden");}\n'
@@ -882,6 +1217,33 @@ def browser_ui():
         '  const clone=JSON.parse(JSON.stringify(obj));\n'
         '  if(clone.results)clone.results=clone.results.map(r=>{const c={...r};if(c.image_base64)c.image_base64="<base64 omitted>";return c;});\n'
         '  document.getElementById(id).textContent=JSON.stringify(clone,null,2);\n'
+        '}\n'
+        'function fmtBytes(n){\n'
+        '  if(n==null)return"?";\n'
+        '  const u=["B","KB","MB","GB","TB"];let v=Number(n);let i=0;\n'
+        '  while(v>=1024&&i<u.length-1){v/=1024;i++;}\n'
+        '  return (i===0?v.toFixed(0):v.toFixed(1))+" "+u[i];\n'
+        '}\n'
+        'function modelMeta(d){\n'
+        '  const parts=[];\n'
+        '  if(d.elapsed_seconds!=null)parts.push("elapsed: "+Number(d.elapsed_seconds).toFixed(1)+"s");\n'
+        '  if(d.last_updated)parts.push("updated: "+new Date(d.last_updated).toLocaleTimeString());\n'
+        '  if(d.cache_path)parts.push("cache: "+d.cache_path);\n'
+        '  return parts.join(" · ");\n'
+        '}\n'
+        'function renderProgress(prefix,d){\n'
+        '  const bar=document.getElementById(prefix+"-progress");\n'
+        '  const fill=document.getElementById(prefix+"-progress-fill");\n'
+        '  const txt=document.getElementById(prefix+"-progress-text");\n'
+        '  if(!bar||!fill||!txt)return;\n'
+        '  const hasBytes=d.bytes_downloaded!=null||d.bytes_expected!=null;\n'
+        '  const pct=d.percent!=null?Number(d.percent):null;\n'
+        '  if(!hasBytes&&pct==null){bar.classList.add("hidden");txt.classList.add("hidden");return;}\n'
+        '  bar.classList.remove("hidden");txt.classList.remove("hidden");\n'
+        '  if(pct!=null){fill.classList.remove("pulse");fill.style.width=Math.max(0,Math.min(100,pct))+"%";}\n'
+        '  else{fill.classList.add("pulse");fill.style.width="35%";}\n'
+        '  const label=(pct!=null?pct.toFixed(1)+"% · ":"")+fmtBytes(d.bytes_downloaded)+" / "+(d.bytes_expected?fmtBytes(d.bytes_expected):"unknown expected");\n'
+        '  txt.textContent=label+(d.last_updated?" · last updated "+new Date(d.last_updated).toLocaleString():"");\n'
         '}\n'
         '\n'
         '// ── 1. GET /api ──────────────────────────────────────────────────\n'
@@ -924,7 +1286,8 @@ def browser_ui():
         '    const s=d.state||"unknown";\n'
         '    badge(document.getElementById("mstatus-badge"),s,bc(s));\n'
         '    setText("mstatus-msg",d.message||"");\n'
-        '    setText("mstatus-elapsed",d.elapsed_seconds!=null?"elapsed: "+d.elapsed_seconds.toFixed(1)+"s":"");\n'
+        '    setText("mstatus-elapsed",modelMeta(d));\n'
+        '    renderProgress("mstatus",d);\n'
         '    if(s==="error"&&d.error){setText("mstatus-err",d.error);show("mstatus-err");}else{hide("mstatus-err");}\n'
         '    setJson("mstatus-pre",d);show("mstatus-result");\n'
         '  }catch(e){setText("mstatus-msg","fetch error: "+e);}finally{hide("mstatus-spin");}\n'
@@ -949,7 +1312,8 @@ def browser_ui():
         '    setJson("pull-pre",d);\n'
         '    badge(document.getElementById("pull-badge"),d.state||"?",bc(d.state));\n'
         '    setText("pull-msg",d.message||"");\n'
-        '    if(d.state==="in_progress"){show("pull-progress");startPullPoll();}else{hide("pull-progress");}\n'
+        '    renderProgress("pull",d);\n'
+        '    if(d.state==="in_progress"){show("pull-progress");startPullPoll();}else{hide("pull-progress");hide("pull-progress-text");}\n'
         '    if(d.state==="error"&&d.error){setText("pull-err",d.error);show("pull-err");}\n'
         '  }catch(e){setText("pull-err","Request failed: "+e);show("pull-err");}\n'
         '  finally{hide("pull-spin");document.getElementById("btn-pull").disabled=false;}\n'
@@ -960,7 +1324,7 @@ def browser_ui():
         '}\n'
         'function stopPullPoll(){\n'
         '  if(_pullPollTimer){clearInterval(_pullPollTimer);_pullPollTimer=null;}\n'
-        '  hide("pull-poll-status");hide("pull-progress");\n'
+        '  hide("pull-poll-status");hide("pull-progress");hide("pull-progress-text");\n'
         '}\n'
         'async function doPullPoll(){\n'
         '  const elapsed=_pullStart?((Date.now()-_pullStart)/1000).toFixed(0)+"s":"?";\n'
@@ -970,8 +1334,9 @@ def browser_ui():
         '    const s=d.state||"unknown";\n'
         '    badge(document.getElementById("pull-badge"),s,bc(s));\n'
         '    setText("pull-msg",d.message||"");\n'
+        '    renderProgress("pull",d);\n'
         '    setJson("pull-status-pre",d);show("pull-status-details");\n'
-        '    if(s==="ready"||s==="error"||s==="not_started"){stopPullPoll();}\n'
+        '    if(s==="ready"||s==="error"||s==="not_started"||s==="stalled"){stopPullPoll();}\n'
         '    if(s==="error"&&d.error){setText("pull-err",d.error);show("pull-err");}\n'
         '    else{hide("pull-err");}\n'
         '  }catch(e){/* keep polling */}\n'
@@ -1104,7 +1469,7 @@ def root():
             "POST /generate/async": "Start background generation (returns 202); poll GET /generate/status",
             "GET /generate/status": "Poll async generation state: idle | in_progress | ready | error",
             "POST /model/pull": "Start async model download/warm-up (returns 202)",
-            "GET /model/status": "Poll model warm-up state"
+            "GET /model/status": "Poll model warm-up state and durable cache progress"
         },
         "documentation": "POST /generate with JSON batch config containing 'prompts' array"
     }), 200
@@ -1114,4 +1479,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"Starting SDXL Generation API on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
-
