@@ -3,7 +3,11 @@
 Stable Diffusion XL image generation script.
 Uses SDXL Base 1.0 with optional refiner for high-quality output.
 
-Model: stabilityai/stable-diffusion-xl-base-1.0
+Default model: stabilityai/stable-diffusion-xl-base-1.0
+Configurable via environment variables:
+  SDXL_BASE_MODEL     — HF repo id or local path for the base model
+  SDXL_REFINER_MODEL  — HF repo id or local path for the refiner
+  SDXL_MODEL_REVISION — optional git revision / branch / tag
 License: CreativeML Open RAIL++-M
 """
 
@@ -33,6 +37,14 @@ if hasattr(_filelock, "SoftFileLock"):
 import torch
 from diffusers import DiffusionPipeline
 
+BASE_MODEL = os.environ.get(
+    "SDXL_BASE_MODEL", "stabilityai/stable-diffusion-xl-base-1.0"
+)
+REFINER_MODEL = os.environ.get(
+    "SDXL_REFINER_MODEL", "stabilityai/stable-diffusion-xl-refiner-1.0"
+)
+MODEL_REVISION = os.environ.get("SDXL_MODEL_REVISION") or None
+
 
 class OOMError(RuntimeError):
     """Raised when GPU/MPS runs out of memory during generation."""
@@ -54,6 +66,8 @@ def parse_args():
     parser.add_argument("--width", type=int, default=1024, help="Image width in pixels")
     parser.add_argument("--height", type=int, default=1024, help="Image height in pixels")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--negative-prompt", dest="negative_prompt", default=None,
+                        help="Negative prompt (things to avoid in the image)")
     parser.add_argument("--refine", action="store_true", help="Use base + refiner pipeline (higher quality)")
     parser.add_argument("--cpu", action="store_true", help="Force CPU mode (slow, no GPU required)")
     return parser.parse_args()
@@ -80,12 +94,13 @@ def get_dtype(device: str):
 
 def load_base(device: str) -> DiffusionPipeline:
     """Load SDXL base model."""
-    print("📥 Loading SDXL base model (first run downloads ~7GB)...")
+    print(f"📥 Loading SDXL base model ({BASE_MODEL}) (first run downloads ~7GB)...")
     dtype = get_dtype(device)
     pipe = DiffusionPipeline.from_pretrained(
-        "stabilityai/stable-diffusion-xl-base-1.0",
+        BASE_MODEL,
         torch_dtype=dtype,
         use_safetensors=True,
+        revision=MODEL_REVISION,
         # fp16 variant available for CUDA and MPS
         variant="fp16" if device in ("cuda", "mps") else None,
     )
@@ -115,15 +130,16 @@ def load_base(device: str) -> DiffusionPipeline:
 
 def load_refiner(text_encoder_2, vae, device: str) -> DiffusionPipeline:
     """Load SDXL refiner, sharing text encoder and VAE from base."""
-    print("📥 Loading SDXL refiner model...")
+    print(f"📥 Loading SDXL refiner model ({REFINER_MODEL})...")
     dtype = get_dtype(device)
     refiner = DiffusionPipeline.from_pretrained(
-        "stabilityai/stable-diffusion-xl-refiner-1.0",
+        REFINER_MODEL,
         # Share components with base to save VRAM
         text_encoder_2=text_encoder_2,
         vae=vae,
         torch_dtype=dtype,
         use_safetensors=True,
+        revision=MODEL_REVISION,
         variant="fp16" if device in ("cuda", "mps") else None,
     )
     if device == "mps":
@@ -144,6 +160,7 @@ def load_refiner(text_encoder_2, vae, device: str) -> DiffusionPipeline:
 def generate(args) -> str:
     """Run image generation and save to output path."""
     device = get_device(args.cpu)
+    negative_prompt = getattr(args, "negative_prompt", None)
 
     # Fix 3: Pre-flight flush — reclaim any GPU memory from a prior generate()
     # call before loading new pipelines. Reduces OOM risk in back-to-back runs.
@@ -181,6 +198,7 @@ def generate(args) -> str:
             # Stage 1: base model produces latents
             latents = base(
                 prompt=args.prompt,
+                negative_prompt=negative_prompt,
                 num_inference_steps=args.steps,
                 guidance_scale=args.guidance,
                 width=args.width,
@@ -210,6 +228,7 @@ def generate(args) -> str:
             refiner = load_refiner(text_encoder_2, vae, device)
             image = refiner(
                 prompt=args.prompt,
+                negative_prompt=negative_prompt,
                 num_inference_steps=args.steps,
                 guidance_scale=args.guidance,
                 denoising_start=high_noise_frac,
@@ -222,6 +241,7 @@ def generate(args) -> str:
             base = load_base(device)
             image = base(
                 prompt=args.prompt,
+                negative_prompt=negative_prompt,
                 num_inference_steps=args.steps,
                 guidance_scale=args.guidance,
                 width=args.width,
@@ -270,12 +290,14 @@ def run_batch(
     height: int = 1024,
     refine: bool = False,
     cpu: bool = False,
+    negative_prompt: str | None = None,
 ) -> list[dict]:
     """Generate a batch using the Flask API parameter shape."""
     results = []
     for item in prompts:
         args = SimpleNamespace(
             prompt=item["prompt"],
+            negative_prompt=item.get("negative_prompt", negative_prompt),
             output=item.get("output"),
             seed=item.get("seed"),
             steps=steps,
@@ -304,17 +326,22 @@ def run_batch(
     return results
 
 
-def batch_generate(prompts: list[dict], device: str = "mps") -> list[dict]:
+def batch_generate(
+    prompts: list[dict],
+    device: str = "mps",
+    negative_prompt: str | None = None,
+) -> list[dict]:
     """
     Generate images for a list of prompt dicts, flushing GPU memory between items.
 
-    Each input dict: {"prompt": str, "output": str, "seed": int (optional)}
+    Each input dict: {"prompt": str, "output": str, "seed": int (optional), "negative_prompt": str (optional)}
     Returns list of {"prompt": str, "output": str, "status": "ok"|"error", "error": str|None}
     """
     results = []
     for i, item in enumerate(prompts):
         args = SimpleNamespace(
             prompt=item["prompt"],
+            negative_prompt=item.get("negative_prompt", negative_prompt),
             output=item["output"],
             seed=item.get("seed"),
             steps=40,
@@ -383,7 +410,7 @@ def main():
             print(f"Error: invalid JSON in batch file: {e}", file=sys.stderr)
             sys.exit(1)
         device = "cpu" if args.cpu else get_device(False)
-        results = batch_generate(prompts, device=device)
+        results = batch_generate(prompts, device=device, negative_prompt=args.negative_prompt)
         for r in results:
             status = r['status']
             print(f"[{status}] {r['prompt'][:50]} → {r.get('output', r.get('error', ''))}")
