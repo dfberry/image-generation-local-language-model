@@ -1,0 +1,17 @@
+name: sdxl-managed-endpoint
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch=2.2.*
+  - pytorch-cuda=12.1
+  - pip:
+      - azureml-inference-server-http
+      - diffusers>=0.30.0
+      - transformers>=4.40.0
+      - accelerate>=0.30.0
+      - safetensors>=0.4.0
+      - pillow>=10.0.0
