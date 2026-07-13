@@ -1142,7 +1142,7 @@ azd up
 > **⚠️ First deploy to a brand-new environment needs two commands:**
 >
 > ```console
-> azd up          # provisions infra + placeholder, builds & pushes the real image
+> azd up          # provisions infra + placeholder, builds the real image in ACR
 > azd provision   # flips apiExists=true → applies the real Flask command
 > ```
 >
