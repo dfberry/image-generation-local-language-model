@@ -37,13 +37,13 @@ if hasattr(_filelock, "SoftFileLock"):
 import torch
 from diffusers import DiffusionPipeline
 
-BASE_MODEL = os.environ.get(
-    "SDXL_BASE_MODEL", "stabilityai/stable-diffusion-xl-base-1.0"
-)
+DEFAULT_BASE_MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
+BASE_MODEL = os.environ.get("SDXL_BASE_MODEL", DEFAULT_BASE_MODEL)
 REFINER_MODEL = os.environ.get(
     "SDXL_REFINER_MODEL", "stabilityai/stable-diffusion-xl-refiner-1.0"
 )
 MODEL_REVISION = os.environ.get("SDXL_MODEL_REVISION") or None
+BASE_MODEL_LOCAL_DIR_NAME = "sdxl-base-1.0"
 
 
 class OOMError(RuntimeError):
@@ -78,17 +78,20 @@ def parse_args():
     return parser.parse_args()
 
 
-def get_device(force_cpu: bool = False) -> str:
+def get_device(force_cpu: bool = False, verbose: bool = True) -> str:
     """Detect best available device."""
     if force_cpu:
         return "cpu"
     if torch.cuda.is_available():
-        print("✅ CUDA GPU detected")
+        if verbose:
+            print("✅ CUDA GPU detected")
         return "cuda"
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        print("✅ Apple Silicon (MPS) detected")
+        if verbose:
+            print("✅ Apple Silicon (MPS) detected")
         return "mps"
-    print("⚠️  No GPU detected — falling back to CPU (slow)")
+    if verbose:
+        print("⚠️  No GPU detected — falling back to CPU (slow)")
     return "cpu"
 
 
@@ -97,17 +100,45 @@ def get_dtype(device: str):
     return torch.float16 if device in ("cuda", "mps") else torch.float32
 
 
+def get_base_model_local_dir() -> str:
+    override = os.environ.get("SDXL_BASE_MODEL_DIR")
+    if override:
+        return os.path.abspath(os.path.expandvars(os.path.expanduser(override)))
+    hf_home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+    return os.path.join(hf_home, "models", BASE_MODEL_LOCAL_DIR_NAME)
+
+
+def _is_populated_dir(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [name for name in dirs if name != ".cache"]
+        if any(name for name in files if not os.path.islink(os.path.join(root, name))):
+            return True
+    return False
+
+
+def get_base_model_source() -> str:
+    if os.environ.get("SDXL_BASE_MODEL"):
+        return BASE_MODEL
+    local_dir = get_base_model_local_dir()
+    return local_dir if _is_populated_dir(local_dir) else BASE_MODEL
+
+
 def load_base(device: str) -> DiffusionPipeline:
     """Load SDXL base model."""
-    print(f"📥 Loading SDXL base model ({BASE_MODEL}) (first run downloads ~7GB)...")
+    model_source = get_base_model_source()
+    print(f"📥 Loading SDXL base model ({model_source}) (first run downloads model weights)...")
     dtype = get_dtype(device)
+    # The flat prewarm dir intentionally contains fp32 safetensors only; asking
+    # for an fp16 variant there would make diffusers look for files we skipped.
+    variant = "fp16" if device in ("cuda", "mps") and model_source == BASE_MODEL else None
     pipe = DiffusionPipeline.from_pretrained(
-        BASE_MODEL,
+        model_source,
         torch_dtype=dtype,
         use_safetensors=True,
         revision=MODEL_REVISION,
-        # fp16 variant available for CUDA and MPS
-        variant="fp16" if device in ("cuda", "mps") else None,
+        variant=variant,
     )
     if device == "mps":
         # MPS benefits from model CPU offload

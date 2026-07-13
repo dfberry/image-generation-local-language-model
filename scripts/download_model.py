@@ -1,22 +1,21 @@
 """
-Optional prewarm helper: pre-populate the HF model cache before a run so the
+Optional prewarm helper: pre-populate the local model directory before a run so the
 first generation request doesn't have to wait for a ~7 GB download.
 
 This script is NOT required — the app downloads models on demand into the HF
-cache directory on first use.  Run it ahead of time (e.g., locally before the
+model directory on first use.  Run it ahead of time (e.g., locally before the
 first CLI run, or as a one-shot init container) if you want instant startup.
 
 Cache directory behaviour:
-  - When HF_HOME is set (e.g. in containers): downloads to $HF_HOME/hub — same
-    path the app reads, so the prewarm is used immediately.
-  - When HF_HOME is unset (local host): no cache_dir override is passed;
-    snapshot_download uses the huggingface_hub library default
-    (~/.cache/huggingface/hub), which is exactly where DiffusionPipeline reads.
+  - Base model downloads to SDXL_BASE_MODEL_DIR when set.
+  - Otherwise it downloads to $HF_HOME/models/sdxl-base-1.0, or
+    ~/.cache/huggingface/models/sdxl-base-1.0 when HF_HOME is unset.
 
 Mount a persistent volume at $HF_HOME so downloads survive container restarts.
 
 Environment variables:
   SDXL_BASE_MODEL     — HF repo id for the base model
+  SDXL_BASE_MODEL_DIR — local directory for the flat base model download
   SDXL_REFINER_MODEL  — HF repo id for the refiner model
   SDXL_MODEL_REVISION — optional git revision / branch / tag (default: latest)
   HUGGING_FACE_TOKEN  — optional Hugging Face token (gated models); falls back to HF_TOKEN
@@ -45,13 +44,19 @@ REFINER_MODEL = os.environ.get(
 MODEL_REVISION = os.environ.get("SDXL_MODEL_REVISION") or None
 HF_TOKEN = os.environ.get("HUGGING_FACE_TOKEN") or os.environ.get("HF_TOKEN") or None  # HF_TOKEN is the huggingface_hub standard auto-detected fallback
 BAKE_REFINER = os.environ.get("BAKE_REFINER", "false").lower() == "true"
-
-# When HF_HOME is set (containers), resolve $HF_HOME/hub so prewarm and app read
-# the same path.  When unset (local host), pass no cache_dir — snapshot_download
-# then uses the huggingface_hub library default (~/.cache/huggingface/hub), which
-# is exactly where DiffusionPipeline.from_pretrained reads on the same host.
-_hf_home = os.environ.get("HF_HOME")
-CACHE_DIR = os.path.join(_hf_home, "hub") if _hf_home else None
+BASE_MODEL_LOCAL_DIR_NAME = "sdxl-base-1.0"
+REFINER_MODEL_LOCAL_DIR_NAME = "sdxl-refiner-1.0"
+MODEL_DOWNLOAD_IGNORE_PATTERNS = [
+    "*.bin",
+    "*.pt",
+    "*.pth",
+    "*.ckpt",
+    "*.onnx",
+    "*.onnx_data",
+    "*.msgpack",
+    "*.fp16.safetensors",
+    "*.fp16.bin",
+]
 
 kwargs = {}
 if MODEL_REVISION:
@@ -60,20 +65,37 @@ if HF_TOKEN:
     kwargs["token"] = HF_TOKEN
 
 
-def download(repo_id: str) -> None:
+def get_hf_cache_root() -> str:
+    return os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+
+
+def get_base_model_local_dir() -> str:
+    override = os.environ.get("SDXL_BASE_MODEL_DIR")
+    if override:
+        return os.path.abspath(os.path.expandvars(os.path.expanduser(override)))
+    return os.path.join(get_hf_cache_root(), "models", BASE_MODEL_LOCAL_DIR_NAME)
+
+
+def get_refiner_model_local_dir() -> str:
+    return os.path.join(get_hf_cache_root(), "models", REFINER_MODEL_LOCAL_DIR_NAME)
+
+
+def download(repo_id: str, local_dir: str, *, ignore_patterns: list[str] | None = None) -> None:
     print(f"⬇️  Downloading {repo_id}" + (f" @ {MODEL_REVISION}" if MODEL_REVISION else "") + " …")
     kw = dict(kwargs)
-    if CACHE_DIR is not None:
-        kw["cache_dir"] = CACHE_DIR
+    kw["local_dir"] = local_dir
+    if ignore_patterns:
+        # Store a single flat fp32 safetensors copy; the HF hub cache duplicates
+        # blobs under snapshots on SMB-backed Azure Files.
+        kw["ignore_patterns"] = ignore_patterns
     snapshot_download(repo_id=repo_id, **kw)
-    cache_display = CACHE_DIR or "default HF cache (~/.cache/huggingface/hub)"
-    print(f"✅  {repo_id} cached to {cache_display}")
+    print(f"✅  {repo_id} cached to {local_dir}")
 
 
-download(BASE_MODEL)
+download(BASE_MODEL, get_base_model_local_dir(), ignore_patterns=MODEL_DOWNLOAD_IGNORE_PATTERNS)
 
 if BAKE_REFINER:
-    download(REFINER_MODEL)
+    download(REFINER_MODEL, get_refiner_model_local_dir())
 else:
     print(f"ℹ️  BAKE_REFINER=false — skipping refiner ({REFINER_MODEL}). Pass --build-arg BAKE_REFINER=true to include it.")
 
