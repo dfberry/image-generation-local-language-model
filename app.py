@@ -23,6 +23,7 @@ import gc
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 from typing import Any, Optional
@@ -635,6 +636,29 @@ def _run_generation(config: dict) -> None:
             })
 
 
+# SDXL's CLIP text encoders have a fixed context window of 77 tokens
+# (75 content tokens + BOS/EOS). Anything past that is silently truncated by
+# diffusers, so we cap prompt input at this limit and warn the user instead.
+MAX_PROMPT_TOKENS = 77
+
+_TOKEN_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+_TOKEN_PUNCT_RE = re.compile(r"[^\sA-Za-z0-9]")
+
+
+def estimate_clip_tokens(text: str) -> int:
+    """Approximate the CLIP token count for a prompt.
+
+    This is a lightweight estimate (words + punctuation marks + BOS/EOS) that
+    mirrors the browser-side counter, so the model never silently drops text.
+    It is intentionally conservative rather than a full BPE tokenizer.
+    """
+    if not text:
+        return 0
+    words = len(_TOKEN_WORD_RE.findall(text))
+    punct = len(_TOKEN_PUNCT_RE.findall(text))
+    return words + punct + 2  # +2 for the BOS/EOS special tokens
+
+
 def validate_batch_config(config: dict) -> Optional[str]:
     """Validate batch configuration structure. Returns error message if invalid."""
     if not isinstance(config, dict):
@@ -655,6 +679,23 @@ def validate_batch_config(config: dict) -> Optional[str]:
         
         if "prompt" not in prompt_obj or not isinstance(prompt_obj["prompt"], str):
             return f"Prompt at index {i} missing 'prompt' string"
+
+        est = estimate_clip_tokens(prompt_obj["prompt"])
+        if est > MAX_PROMPT_TOKENS:
+            return (
+                f"Prompt at index {i} is too long (~{est} tokens). "
+                f"SDXL's CLIP text encoder only reads the first {MAX_PROMPT_TOKENS} "
+                f"tokens; shorten the prompt so nothing is silently dropped."
+            )
+
+        neg = prompt_obj.get("negative_prompt")
+        if isinstance(neg, str) and neg:
+            neg_est = estimate_clip_tokens(neg)
+            if neg_est > MAX_PROMPT_TOKENS:
+                return (
+                    f"Negative prompt at index {i} is too long (~{neg_est} tokens). "
+                    f"Keep it under the {MAX_PROMPT_TOKENS}-token CLIP limit."
+                )
     
     return None
 
@@ -1151,6 +1192,8 @@ def browser_ui():
         'a.dl{display:inline-block;padding:.25rem .55rem;background:#27272a;color:#a78bfa;border-radius:4px;font-size:.72rem;text-decoration:none;font-weight:600}\n'
         'a.dl:hover{background:#3f3f46}\n'
         '.hint{font-size:.72rem;color:#52525b;margin-top:.2rem}\n'
+        '.tok-count{display:block;font-size:.7rem;color:#52525b;margin-top:.2rem;text-align:right}\n'
+        '.tok-count.over{color:#f87171;font-weight:600}\n'
         'hr{border:none;border-top:1px solid #1f1f2e;margin:.3rem 0 .7rem}\n'
         '</style>\n'
         '</head>\n'
@@ -1265,8 +1308,8 @@ def browser_ui():
         '  </div>\n'
         '\n'
         '  <div class="tp on" id="tp-prompt">\n'
-        '    <div class="field"><label>Prompt *</label><input type="text" id="p-prompt" placeholder="a serene mountain lake at sunrise, photorealistic"></div>\n'
-        '    <div class="field"><label>Negative prompt</label><input type="text" id="p-neg" placeholder="blur, noise, cartoon"></div>\n'
+        '    <div class="field"><label>Prompt *</label><input type="text" id="p-prompt" placeholder="a serene mountain lake at sunrise, photorealistic" oninput="updateTokCount()"><span class="tok-count" id="p-prompt-tok">0 / 77 tokens</span></div>\n'
+        '    <div class="field"><label>Negative prompt</label><input type="text" id="p-neg" placeholder="blur, noise, cartoon" oninput="updateTokCount()"><span class="tok-count" id="p-neg-tok">0 / 77 tokens</span></div>\n'
         '    <div class="grid3" style="margin-bottom:.65rem">\n'
         '      <div class="field"><label>Steps (1-150)</label><input type="number" id="p-steps" value="20" min="1" max="150"></div>\n'
         '      <div class="field"><label>Guidance (0-50)</label><input type="number" id="p-guidance" value="7.5" min="0" max="50" step="0.5"></div>\n'
@@ -1323,6 +1366,8 @@ def browser_ui():
         'function badge(el,txt,cls){el.textContent=txt;el.className="badge "+cls;}\n'
         'function show(id){document.getElementById(id).classList.remove("hidden");}\n'
         'function hide(id){document.getElementById(id).classList.add("hidden");}\n'
+        'function estClipTokens(t){if(!t)return 0;t=t.trim();if(!t)return 0;const w=(t.match(/[A-Za-z0-9]+/g)||[]).length;const p=(t.match(/[^\\sA-Za-z0-9]/g)||[]).length;return w+p+2;}\n'
+        'function updateTokCount(){[["p-prompt","p-prompt-tok"],["p-neg","p-neg-tok"]].forEach(function(pair){const inp=document.getElementById(pair[0]);const out=document.getElementById(pair[1]);if(!inp||!out)return;const n=estClipTokens(inp.value);out.textContent=n+" / 77 tokens";out.classList.toggle("over",n>77);});}\n'
         'function setText(id,t){document.getElementById(id).textContent=t;}\n'
         'function setJson(id,obj){\n'
         '  // strip image_base64 from display to keep pre readable\n'
@@ -1522,6 +1567,7 @@ def browser_ui():
         '    if(!p){const e=document.getElementById("gen-err");e.textContent="Prompt is required.";e.classList.remove("hidden");setGenerateActive(false);return;}\n'
         '    const po={prompt:p};\n'
         '    const neg=document.getElementById("p-neg").value.trim();if(neg)po.negative_prompt=neg;\n'
+        '    if(estClipTokens(p)>77||(neg&&estClipTokens(neg)>77)){const e=document.getElementById("gen-err");e.textContent="Prompt or negative prompt is over the 77-token CLIP limit. Shorten it — text past 77 tokens is silently dropped by the model.";e.classList.remove("hidden");setGenerateActive(false);return;}\n'
         '    const seed=document.getElementById("p-seed").value.trim();if(seed)po.seed=parseInt(seed,10);\n'
         '    body={prompts:[po],steps:parseInt(document.getElementById("p-steps").value,10)||20,guidance:parseFloat(document.getElementById("p-guidance").value)||7.5,width:parseInt(document.getElementById("p-width").value,10)||512,height:parseInt(document.getElementById("p-height").value,10)||512,refine:document.getElementById("p-refine").checked,cpu:document.getElementById("p-cpu").checked};\n'
         '  }else{\n'
