@@ -145,14 +145,11 @@ def load_base(device: str) -> DiffusionPipeline:
         pipe.enable_model_cpu_offload()
     elif device == "cpu":
         # Pure CPU: offload requires an accelerator, so keep the pipeline
-        # resident and cut peak RAM with attention/VAE slicing + tiling.
+        # resident. VAE tiling causes SDXL tile-seam/rainbow-band artifacts
+        # at <=1024px and is only needed for 2K+; attention slicing alone
+        # keeps peak RAM in check.
         pipe.to("cpu")
         pipe.enable_attention_slicing()
-        try:
-            pipe.enable_vae_slicing()
-            pipe.enable_vae_tiling()
-        except Exception:
-            pass
     else:
         pipe.to(device)
 
@@ -181,13 +178,11 @@ def load_refiner(text_encoder_2, vae, device: str) -> DiffusionPipeline:
     if device == "mps":
         refiner.enable_model_cpu_offload()
     elif device == "cpu":
+        # VAE tiling causes SDXL tile-seam/rainbow-band artifacts at <=1024px
+        # and is only needed for 2K+; attention slicing alone keeps peak RAM
+        # in check.
         refiner.to("cpu")
         refiner.enable_attention_slicing()
-        try:
-            refiner.enable_vae_slicing()
-            refiner.enable_vae_tiling()
-        except Exception:
-            pass
     else:
         refiner.to(device)
     return refiner
