@@ -56,11 +56,19 @@ var realContainer = {
       name: 'PORT'
       value: '8000'
     }
+    {
+      name: 'HISTORY_DIR'
+      value: '/app/history'
+    }
   ]
   volumeMounts: !empty(storageAccountName) ? [
     {
       volumeName: 'models-cache'
       mountPath: '/root/.cache/huggingface'
+    }
+    {
+      volumeName: 'history-cache'
+      mountPath: '/app/history'
     }
   ] : []
   probes: [
@@ -142,6 +150,11 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
           name: 'models-cache'
           storageType: 'AzureFile'
           storageName: 'models-storage'
+        }
+        {
+          name: 'history-cache'
+          storageType: 'AzureFile'
+          storageName: 'history-storage'
         }
       ] : []
       scale: {

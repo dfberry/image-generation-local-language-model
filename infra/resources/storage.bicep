@@ -16,6 +16,9 @@ param environmentName string
 param fileShareName string = 'models'
 param storageName string = 'models-storage'
 param shareQuotaGb int = 100
+param historyShareName string = 'history'
+param historyStorageName string = 'history-storage'
+param historyShareQuotaGb int = 50
 
 resource storage 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   name: storageAccountName
@@ -45,6 +48,15 @@ resource share 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-01-01
   }
 }
 
+resource historyShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-01-01' = {
+  parent: fileService
+  name: historyShareName
+  properties: {
+    shareQuota: historyShareQuotaGb
+    enabledProtocols: 'SMB'
+  }
+}
+
 // Register the file share with the Container Apps environment under a stable
 // name ('models-storage'). The container app's volume references this name.
 resource environment 'Microsoft.App/managedEnvironments@2023-05-01' existing = {
@@ -67,7 +79,24 @@ resource environmentStorage 'Microsoft.App/managedEnvironments/storages@2023-05-
   ]
 }
 
+resource environmentHistoryStorage 'Microsoft.App/managedEnvironments/storages@2023-05-01' = {
+  parent: environment
+  name: historyStorageName
+  properties: {
+    azureFile: {
+      accountName: storage.name
+      accountKey: storage.listKeys().keys[0].value
+      shareName: historyShareName
+      accessMode: 'ReadWrite'
+    }
+  }
+  dependsOn: [
+    historyShare
+  ]
+}
+
 output storageAccountName string = storage.name
 output storageName string = storageName
+output historyStorageName string = historyStorageName
 @secure()
 output storageAccountKey string = storage.listKeys().keys[0].value
