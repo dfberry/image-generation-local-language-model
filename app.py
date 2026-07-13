@@ -35,8 +35,9 @@ from flask import Flask, request, jsonify, make_response, send_file, abort
 from datetime import datetime, timezone
 
 from src.image_generation.generate import (
-    run_batch, OOMError, GenerationCancelled, get_device, load_base
+    BASE_MODEL, run_batch, OOMError, GenerationCancelled, get_device, load_base
 )
+from huggingface_hub import snapshot_download
 
 
 # Setup logging
@@ -71,14 +72,37 @@ def _options_preflight(path):
 # Model warm-up state
 # ---------------------------------------------------------------------------
 BASE_MODEL_CACHE_DIR = "models--stabilityai--stable-diffusion-xl-base-1.0"
+BASE_MODEL_LOCAL_DIR_NAME = "sdxl-base-1.0"
 PROGRESS_FILE_NAME = ".pull-progress.json"
 PULL_STALE_AFTER_SECONDS = 120
 PULL_HEARTBEAT_SECONDS = 5
-BASE_MODEL_EXPECTED_BYTES = int(os.environ.get(
-    "SDXL_BASE_MODEL_EXPECTED_BYTES", str(7 * 1024 * 1024 * 1024)
-))
+MODEL_DOWNLOAD_IGNORE_PATTERNS = [
+    "*.bin",
+    "*.pt",
+    "*.pth",
+    "*.ckpt",
+    "*.onnx",
+    "*.onnx_data",
+    "*.msgpack",
+    "*.fp16.safetensors",
+    "*.fp16.bin",
+]
+
+
+def default_expected_bytes(device: Optional[str] = None) -> int:
+    override = os.environ.get("SDXL_BASE_MODEL_EXPECTED_BYTES")
+    if override:
+        return int(override)
+    device = device or get_device(verbose=False)
+    # CPU loads fp32 weights (~14 GiB). CUDA/MPS keep the old fp16 estimate.
+    return (7 if device in ("cuda", "mps") else 14) * 1024 * 1024 * 1024
+
+
+BASE_MODEL_EXPECTED_BYTES = default_expected_bytes()
 BASE_MODEL_READY_MIN_BYTES = int(os.environ.get(
-    "SDXL_BASE_MODEL_READY_MIN_BYTES", str(5 * 1024 * 1024 * 1024)
+    # Flat fp32 safetensors are ~14 GiB, so 10 GiB avoids marking partial
+    # downloads ready while staying below the full CPU-sized payload.
+    "SDXL_BASE_MODEL_READY_MIN_BYTES", str(10 * 1024 * 1024 * 1024)
 ))
 
 _model_state_lock = threading.Lock()
@@ -140,6 +164,15 @@ def get_base_model_cache_path(cache_root: Optional[str] = None) -> str:
     )
 
 
+def get_base_model_local_dir(cache_root: Optional[str] = None) -> str:
+    override = os.environ.get("SDXL_BASE_MODEL_DIR")
+    if override:
+        return os.path.abspath(os.path.expandvars(os.path.expanduser(override)))
+    return os.path.join(
+        cache_root or get_hf_cache_root(), "models", BASE_MODEL_LOCAL_DIR_NAME
+    )
+
+
 def get_pull_progress_path(cache_root: Optional[str] = None) -> str:
     return os.path.join(cache_root or get_hf_cache_root(), PROGRESS_FILE_NAME)
 
@@ -148,13 +181,40 @@ def _safe_dir_size(path: str) -> int:
     total = 0
     if not os.path.isdir(path):
         return 0
-    for root, _, files in os.walk(path):
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [
+            name for name in dirs
+            if name != ".cache" and not os.path.islink(os.path.join(root, name))
+        ]
         for name in files:
+            file_path = os.path.join(root, name)
             try:
-                total += os.path.getsize(os.path.join(root, name))
+                if os.path.islink(file_path):
+                    continue
+                total += os.path.getsize(file_path)
             except OSError:
                 continue
     return total
+
+
+def _model_bytes_on_disk(path: str) -> int:
+    if not os.path.isdir(path):
+        return 0
+    blobs_path = os.path.join(path, "blobs")
+    snapshots_path = os.path.join(path, "snapshots")
+    if os.path.isdir(blobs_path) and os.path.isdir(snapshots_path):
+        # HF hub snapshots are symlinks on Linux and real copies on SMB; count
+        # only blobs so progress reflects one logical model payload.
+        return _safe_dir_size(blobs_path)
+    return _safe_dir_size(path)
+
+
+def get_base_model_measurement_path(cache_root: Optional[str] = None) -> str:
+    local_dir = get_base_model_local_dir(cache_root)
+    old_cache_path = get_base_model_cache_path(cache_root)
+    if _model_bytes_on_disk(local_dir) > 0 or not os.path.exists(old_cache_path):
+        return local_dir
+    return old_cache_path
 
 
 def _calculate_percent(bytes_downloaded: Optional[int], bytes_expected: Optional[int]) -> Optional[float]:
@@ -172,12 +232,14 @@ def _progress_payload(
     error: Optional[str] = None,
     cache_root: Optional[str] = None,
     now: Optional[datetime] = None,
+    device: Optional[str] = None,
 ) -> dict:
     now = now or _utc_now()
     cache_root = cache_root or get_hf_cache_root()
-    cache_path = get_base_model_cache_path(cache_root)
-    bytes_downloaded = _safe_dir_size(cache_path)
-    bytes_expected = BASE_MODEL_EXPECTED_BYTES
+    device = device or get_device(verbose=False)
+    cache_path = get_base_model_measurement_path(cache_root)
+    bytes_downloaded = _model_bytes_on_disk(cache_path)
+    bytes_expected = default_expected_bytes(device)
     started_iso = _iso(started_at)
     finished_iso = _iso(finished_at)
     elapsed_seconds = None
@@ -244,21 +306,9 @@ def is_base_model_cache_present(
     *,
     min_ready_bytes: int = BASE_MODEL_READY_MIN_BYTES,
 ) -> bool:
-    model_path = get_base_model_cache_path(cache_root)
-    snapshots_path = os.path.join(model_path, "snapshots")
-    if not os.path.isdir(snapshots_path):
-        return False
-    has_snapshot = False
-    try:
-        for entry in os.scandir(snapshots_path):
-            if entry.is_dir():
-                has_snapshot = True
-                break
-    except OSError:
-        return False
-    if not has_snapshot:
-        return False
-    return _safe_dir_size(model_path) >= min_ready_bytes
+    return _model_bytes_on_disk(
+        get_base_model_measurement_path(cache_root)
+    ) >= min_ready_bytes
 
 
 def _is_model_pull_worker_alive() -> bool:
@@ -277,7 +327,8 @@ def reconcile_model_status(
     """Reconcile durable progress with the actual HF cache on disk."""
     now = now or _utc_now()
     cache_root = cache_root or get_hf_cache_root()
-    cache_path = get_base_model_cache_path(cache_root)
+    device = get_device(verbose=False)
+    cache_path = get_base_model_measurement_path(cache_root)
 
     with _model_state_lock:
         base = dict(_model_state)
@@ -285,8 +336,8 @@ def reconcile_model_status(
     if progress:
         base.update(progress)
 
-    bytes_downloaded = _safe_dir_size(cache_path)
-    bytes_expected = base.get("bytes_expected") or BASE_MODEL_EXPECTED_BYTES
+    bytes_downloaded = _model_bytes_on_disk(cache_path)
+    bytes_expected = default_expected_bytes(device)
     base["bytes_downloaded"] = bytes_downloaded
     base["bytes_expected"] = bytes_expected
     base["percent"] = _calculate_percent(bytes_downloaded, bytes_expected)
@@ -304,9 +355,9 @@ def reconcile_model_status(
     if model_present and not active_worker:
         base.update({
             "state": "ready",
-            "message": "Model weights are present on the HF cache share.",
-            "bytes_downloaded": _safe_dir_size(cache_path),
-            "bytes_expected": BASE_MODEL_EXPECTED_BYTES,
+            "message": "Model weights are present on the model cache share.",
+            "bytes_downloaded": _model_bytes_on_disk(cache_path),
+            "bytes_expected": bytes_expected,
             "percent": 100.0,
             "weights_present": True,
             "finished_at": base.get("finished_at") or base.get("last_updated"),
@@ -352,6 +403,7 @@ def _heartbeat_pull_progress(stop_event: threading.Event, started: datetime, dev
             "in_progress",
             f"Downloading/loading model on device '{device}'…",
             started_at=started,
+            device=device,
         )
         _safe_write_progress(payload)
 
@@ -363,7 +415,7 @@ def _stop_pull_heartbeat(stop_event: threading.Event, heartbeat: threading.Threa
 
 def _pull_worker() -> None:
     """Background thread: loads the base model to warm the on-disk HF cache."""
-    device = get_device()
+    device = get_device(verbose=False)
     started = _utc_now()
 
     with _model_state_lock:
@@ -382,8 +434,9 @@ def _pull_worker() -> None:
         f"Downloading/loading model on device '{device}'…",
         started_at=started,
         now=started,
+        device=device,
     ))
-    logger.info("model/pull: starting load_base() to warm HF disk cache")
+    logger.info("model/pull: downloading SDXL base model to flat local dir")
     heartbeat_stop = threading.Event()
     heartbeat = threading.Thread(
         target=_heartbeat_pull_progress,
@@ -394,11 +447,25 @@ def _pull_worker() -> None:
     heartbeat.start()
 
     try:
+        download_kwargs = {
+            "repo_id": BASE_MODEL,
+            "local_dir": get_base_model_local_dir(),
+            "ignore_patterns": MODEL_DOWNLOAD_IGNORE_PATTERNS,
+        }
+        revision = os.environ.get("SDXL_MODEL_REVISION") or None
+        token = os.environ.get("HUGGING_FACE_TOKEN") or os.environ.get("HF_TOKEN") or None
+        if revision:
+            download_kwargs["revision"] = revision
+        if token:
+            download_kwargs["token"] = token
+        snapshot_download(**download_kwargs)
+
+        logger.info("model/pull: validating load_base() from local model dir")
         pipe = load_base(device)
 
         # Free the in-memory pipeline immediately — the durable win is the
-        # on-disk HF cache. run_batch() will reload from that warm cache when
-        # /generate is called, avoiding the expensive ~7 GB network download.
+        # flat on-disk model dir. run_batch() reloads from that warm directory
+        # when /generate is called, avoiding the expensive network download.
         del pipe
         gc.collect()
 
@@ -422,6 +489,7 @@ def _pull_worker() -> None:
             started_at=started,
             finished_at=finished,
             now=finished,
+            device=device,
         ))
 
     except (OOMError, Exception) as exc:
@@ -447,6 +515,7 @@ def _pull_worker() -> None:
             finished_at=finished,
             error=msg,
             now=finished,
+            device=device,
         ))
     finally:
         _stop_pull_heartbeat(heartbeat_stop, heartbeat)
@@ -1135,21 +1204,22 @@ def model_pull():
         # Transition to in_progress synchronously (inside the lock) so a
         # concurrent caller sees the right state before the thread starts.
         started = _utc_now()
-        bytes_downloaded = _safe_dir_size(get_base_model_cache_path())
+        device = get_device(verbose=False)
+        cache_path = get_base_model_measurement_path()
+        bytes_downloaded = _model_bytes_on_disk(cache_path)
+        bytes_expected = default_expected_bytes(device)
         _model_state.update({
             "state": "in_progress",
             "message": "Pull started.",
             "bytes_downloaded": bytes_downloaded,
-            "bytes_expected": BASE_MODEL_EXPECTED_BYTES,
-            "percent": _calculate_percent(
-                bytes_downloaded, BASE_MODEL_EXPECTED_BYTES
-            ),
+            "bytes_expected": bytes_expected,
+            "percent": _calculate_percent(bytes_downloaded, bytes_expected),
             "started_at": _iso(started),
             "last_updated": _iso(started),
             "finished_at": None,
             "elapsed_seconds": None,
             "error": None,
-            "cache_path": get_base_model_cache_path(),
+            "cache_path": cache_path,
             "revision": os.environ.get("SDXL_MODEL_REVISION") or None,
         })
 
@@ -1158,6 +1228,7 @@ def model_pull():
         "Pull started.",
         started_at=started,
         now=started,
+        device=device,
     ))
     thread = threading.Thread(target=_pull_worker, daemon=True, name="model-pull")
     with _model_state_lock:
@@ -1195,7 +1266,7 @@ def model_status():
           "timestamp": "<ISO8601>" }
     """
     snapshot = reconcile_model_status(active_worker=_is_model_pull_worker_alive())
-    snapshot["device"] = get_device()
+    snapshot["device"] = get_device(verbose=False)
 
     return jsonify(snapshot), 200
 
