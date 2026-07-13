@@ -99,7 +99,7 @@ Or by name: `docker volume ls` then `docker volume rm <project>_hf-cache`.
 
 ### Layer 3 — Cloud (Azure Container Apps)
 
-`azd up` provisions Azure infrastructure (ACR, Storage, ACA Environment, Container App), then builds the Docker image using `Dockerfile`, pushes it to Azure Container Registry, and updates the Container App to the real image — all in one command. On the very first deploy, the Container App provisions with a harmless placeholder image so ARM succeeds before the ACR is populated; azd then swaps in the real image during the deploy phase.
+`azd up` provisions Azure infrastructure (ACR, Storage, ACA Environment, Container App), then builds the Docker image **in Azure Container Registry** (remote build — `remoteBuild: true` in `azure.yaml`) and updates the Container App to the real image — all in one command. Because the image is built server-side in ACR, no local Docker daemon is used to build or push; only the small build context is uploaded. This avoids local push failures behind a proxy/VPN and guarantees a `linux/amd64` image even from Apple Silicon Macs. On the very first deploy, the Container App provisions with a harmless placeholder image so ARM succeeds before the ACR is populated; azd then swaps in the real image during the deploy phase.
 
 > **Brand-new environment? Run `azd up` then `azd provision`.** On a fresh environment the placeholder is created with `apiExists=false`, and azd's deploy phase swaps only the *image* — not the container's startup command. A second `azd provision` flips `apiExists=true` and applies the real Flask command (`python3 app.py`). Without it, the base URL shows a Python `http.server` directory listing instead of the API. On an *existing* environment a plain `azd up` is enough. See [Deploy to Azure Container Apps](#deploy-to-azure-container-apps).
 
@@ -1160,10 +1160,9 @@ azd up
 
 **What this does:**
 1. Runs `infra/main.bicep` — creates ACR, Storage Account + File Share, ACA Environment, and a Container App (with a placeholder image on first provision so ARM succeeds)
-2. Builds the Docker image using `Dockerfile` (native azd build — no manual `docker build` needed)
-3. Pushes the image to Azure Container Registry
-4. Updates the Container App to the real ACR image
-5. Outputs HTTPS URL
+2. Builds the Docker image **remotely in Azure Container Registry** using `Dockerfile` (`remoteBuild: true` — no local Docker build or push; only the build context is uploaded)
+3. Updates the Container App to the real ACR image
+4. Outputs HTTPS URL
 
 **Output example:**
 ```
@@ -1175,7 +1174,7 @@ Use 'azd deploy' for subsequent updates
 
 **First run takes ~10-20 min:**
 - Infrastructure provisioning (~3-5 min)
-- Container image build & push (~1-2 min — small image, no model)
+- Container image build in ACR (~1-2 min — small image, no model)
 - First request: model downloads ~7 GB into the Azure Files share (~5-10 min); subsequent requests are fast
 
 ### Recovering from a failed first deploy
