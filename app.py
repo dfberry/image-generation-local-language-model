@@ -1120,7 +1120,7 @@ def browser_ui():
         '.cbrow input{width:auto}\n'
         '.spinner{display:inline-block;width:14px;height:14px;border:2px solid #7c3aed;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:.3rem}\n'
         '@keyframes spin{to{transform:rotate(360deg)}}\n'
-        '.hidden{display:none}\n'
+        '.hidden{display:none !important}\n'
         '.badge{display:inline-block;padding:.15rem .55rem;border-radius:20px;font-size:.72rem;font-weight:700;text-transform:uppercase}\n'
         '.ok{background:#14532d;color:#4ade80}.info{background:#1e3a5f;color:#60a5fa}\n'
         '.err{background:#450a0a;color:#f87171}.grey{background:#27272a;color:#a1a1aa}\n'
