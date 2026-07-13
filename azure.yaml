@@ -10,6 +10,14 @@ services:
     docker:
       path: ./Dockerfile
       context: .
+      # Build the image server-side in Azure Container Registry (ACR Tasks)
+      # instead of building locally and pushing. This avoids local Docker
+      # push failures behind an HTTP proxy/VPN (e.g. "use of closed network
+      # connection" on large blob uploads from a Mac) and guarantees a
+      # linux/amd64 image regardless of the host CPU architecture (Apple
+      # Silicon builds arm64 locally, which ACA does not run). Only the small
+      # build context is uploaded; ACR does the heavy build and stores the image.
+      remoteBuild: true
 
 metadata:
   version: 1.0.0
