@@ -24,12 +24,14 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import threading
+import uuid
 from typing import Any, Optional
 
 import torch
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify, make_response, send_file, abort
 from datetime import datetime, timezone
 
 from src.image_generation.generate import (
@@ -52,7 +54,7 @@ app = Flask(__name__)
 @app.after_request
 def _add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
 
@@ -61,7 +63,7 @@ def _add_cors_headers(response):
 def _options_preflight(path):
     resp = make_response("", 204)
     resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return resp
 
@@ -501,6 +503,14 @@ def _run_generation(config: dict) -> None:
         height = int(_resolve("height", 1024))
         refine = _resolve("refine", False)
         use_cpu = _resolve("cpu", False)
+        resolved_settings = {
+            "steps": steps,
+            "guidance": guidance,
+            "width": width,
+            "height": height,
+            "refine": refine,
+            "cpu": use_cpu,
+        }
         device = "cpu" if use_cpu else get_device(use_cpu)
         logger.info(f"generate(async): {image_count} image(s) on device: {device}")
 
@@ -592,6 +602,10 @@ def _run_generation(config: dict) -> None:
 
         finished = datetime.now(timezone.utc)
         ok_count = sum(1 for r in results if r["status"] == "ok")
+        try:
+            _save_history(resolved_settings, prompts, results, device)
+        except Exception as history_err:
+            logger.warning(f"history: async save skipped: {history_err}", exc_info=True)
         with _gen_state_lock:
             _gen_state.update({
                 "state": "ready",
@@ -640,6 +654,168 @@ def _run_generation(config: dict) -> None:
 # (75 content tokens + BOS/EOS). Anything past that is silently truncated by
 # diffusers, so we cap prompt input at this limit and warn the user instead.
 MAX_PROMPT_TOKENS = 77
+
+HISTORY_DIR = os.environ.get("HISTORY_DIR", os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "outputs", "history"
+))
+HISTORY_MAX = int(os.environ.get("HISTORY_MAX", "50"))
+_history_lock = threading.Lock()
+
+
+def _new_history_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
+
+
+def _history_base() -> str:
+    return os.path.abspath(HISTORY_DIR)
+
+
+def _history_folder(hid: str) -> Optional[str]:
+    if not isinstance(hid, str) or not hid or os.path.basename(hid) != hid or ".." in hid:
+        return None
+    base = _history_base()
+    path = os.path.abspath(os.path.join(base, hid))
+    try:
+        if os.path.commonpath([base, path]) != base:
+            return None
+    except ValueError:
+        return None
+    return path
+
+
+def _save_history(settings: dict, prompts_meta: list, results: list, device) -> str | None:
+    try:
+        with _history_lock:
+            hid = _new_history_id()
+            folder = os.path.join(HISTORY_DIR, hid)
+            os.makedirs(folder, exist_ok=True)
+            created_at = datetime.now(timezone.utc).isoformat()
+            prompt_rows = []
+            ok_count = 0
+
+            for i, r in enumerate(results):
+                prompt_meta = prompts_meta[i] if i < len(prompts_meta) and isinstance(prompts_meta[i], dict) else {}
+                status = r.get("status")
+                filename = None
+                if status == "ok":
+                    image_path = os.path.join(folder, f"{i}.png")
+                    if r.get("image_base64"):
+                        with open(image_path, "wb") as handle:
+                            handle.write(base64.b64decode(r["image_base64"]))
+                        filename = f"{i}.png"
+                    elif r.get("output") and os.path.isfile(r["output"]):
+                        shutil.copyfile(r["output"], image_path)
+                        filename = f"{i}.png"
+                    if filename:
+                        ok_count += 1
+                prompt_rows.append({
+                    "prompt": prompt_meta.get("prompt", r.get("prompt")),
+                    "negative_prompt": prompt_meta.get("negative_prompt", r.get("negative_prompt")),
+                    "seed": prompt_meta.get("seed", r.get("seed")),
+                    "status": status,
+                    "error": r.get("error"),
+                    "filename": filename,
+                })
+
+            meta = {
+                "id": hid,
+                "created_at": created_at,
+                "device": device,
+                "settings": {
+                    "steps": settings.get("steps"),
+                    "guidance": settings.get("guidance"),
+                    "width": settings.get("width"),
+                    "height": settings.get("height"),
+                    "refine": settings.get("refine"),
+                    "cpu": settings.get("cpu"),
+                },
+                "image_count": len(results),
+                "ok_count": ok_count,
+                "prompts": prompt_rows,
+            }
+            with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, indent=2)
+                handle.write("\n")
+            _prune_history()
+            return hid
+    except Exception as exc:
+        logger.warning(f"history: failed to save generation history: {exc}", exc_info=True)
+        return None
+
+
+def _prune_history():
+    try:
+        if not os.path.isdir(HISTORY_DIR):
+            return
+        folders = []
+        for name in os.listdir(HISTORY_DIR):
+            path = os.path.join(HISTORY_DIR, name)
+            if os.path.isdir(path) and os.path.isfile(os.path.join(path, "meta.json")):
+                folders.append((name, path))
+        folders.sort(key=lambda item: item[0])
+        while len(folders) > HISTORY_MAX:
+            _, path = folders.pop(0)
+            shutil.rmtree(path)
+    except Exception as exc:
+        logger.warning(f"history: failed to prune generation history: {exc}", exc_info=True)
+
+
+def _list_history(limit: int) -> list:
+    items = []
+    try:
+        if not os.path.isdir(HISTORY_DIR):
+            return items
+        names = sorted(os.listdir(HISTORY_DIR), reverse=True)
+        for name in names:
+            if len(items) >= limit:
+                break
+            folder = _history_folder(name)
+            if not folder:
+                continue
+            meta_path = os.path.join(folder, "meta.json")
+            if not os.path.isfile(meta_path):
+                continue
+            try:
+                with open(meta_path, "r", encoding="utf-8") as handle:
+                    meta = json.load(handle)
+                items.append({
+                    "id": meta.get("id"),
+                    "created_at": meta.get("created_at"),
+                    "device": meta.get("device"),
+                    "image_count": meta.get("image_count"),
+                    "ok_count": meta.get("ok_count"),
+                    "prompts": [
+                        {
+                            "prompt": p.get("prompt"),
+                            "negative_prompt": p.get("negative_prompt"),
+                            "status": p.get("status"),
+                            "filename": p.get("filename"),
+                        }
+                        for p in meta.get("prompts", [])
+                        if isinstance(p, dict)
+                    ],
+                })
+            except Exception as exc:
+                logger.warning(f"history: failed to read history item {name}: {exc}")
+                continue
+    except Exception as exc:
+        logger.warning(f"history: failed to list generation history: {exc}", exc_info=True)
+    return items
+
+
+def _read_meta(hid) -> dict | None:
+    try:
+        folder = _history_folder(hid)
+        if not folder:
+            return None
+        meta_path = os.path.join(folder, "meta.json")
+        if not os.path.isfile(meta_path):
+            return None
+        with open(meta_path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception as exc:
+        logger.warning(f"history: failed to read history meta {hid}: {exc}")
+        return None
 
 _TOKEN_WORD_RE = re.compile(r"[A-Za-z0-9]+")
 _TOKEN_PUNCT_RE = re.compile(r"[^\sA-Za-z0-9]")
@@ -813,6 +989,14 @@ def generate_endpoint():
         height = int(_resolve("height", 1024))
         refine = _resolve("refine", False)
         use_cpu = _resolve("cpu", False)
+        resolved_settings = {
+            "steps": steps,
+            "guidance": guidance,
+            "width": width,
+            "height": height,
+            "refine": refine,
+            "cpu": use_cpu,
+        }
         
         # Validate numeric ranges
         if steps < 1 or steps > 150:
@@ -885,6 +1069,11 @@ def generate_endpoint():
                     r["error"] = f"{existing_error}; read error: {read_err}".lstrip("; ")
             else:
                 r["image_base64"] = None
+
+        try:
+            _save_history(resolved_settings, prompts, results, device)
+        except Exception as history_err:
+            logger.warning(f"history: sync save skipped: {history_err}", exc_info=True)
 
         return jsonify({
             "status": "success",
@@ -1117,6 +1306,88 @@ def generate_status():
 
     return jsonify(snapshot), 200
 
+
+@app.route("/history", methods=["GET"])
+def history_list():
+    limit_raw = request.args.get("limit", str(HISTORY_MAX))
+    try:
+        limit = max(0, min(200, int(limit_raw)))
+    except ValueError:
+        limit = max(0, min(200, HISTORY_MAX))
+    items = _list_history(limit)
+    return jsonify({
+        "status": "success",
+        "items": items,
+        "count": len(items),
+    }), 200
+
+
+@app.route("/history/<hid>", methods=["GET"])
+def history_detail(hid):
+    meta = _read_meta(hid)
+    if meta is None:
+        abort(404)
+    return jsonify(meta), 200
+
+
+@app.route("/history/<hid>/image/<int:n>", methods=["GET"])
+def history_image(hid, n):
+    try:
+        folder = _history_folder(hid)
+        if not folder:
+            abort(404)
+        base = _history_base()
+        path = os.path.abspath(os.path.join(folder, f"{n}.png"))
+        if os.path.commonpath([base, path]) != base:
+            abort(404)
+        if not os.path.isfile(path):
+            abort(404)
+        return send_file(path, mimetype="image/png")
+    except ValueError:
+        abort(404)
+    except OSError as exc:
+        logger.warning(f"history: failed to serve image {hid}/{n}: {exc}")
+        abort(404)
+
+
+@app.route("/history/<hid>", methods=["DELETE"])
+def history_delete(hid):
+    folder = _history_folder(hid)
+    if not folder or not os.path.isdir(folder):
+        abort(404)
+    with _history_lock:
+        if not os.path.isdir(folder):
+            abort(404)
+        try:
+            shutil.rmtree(folder)
+        except Exception as exc:
+            logger.warning(f"history: failed to delete history item {hid}: {exc}", exc_info=True)
+            abort(404)
+    return jsonify({
+        "status": "success",
+        "deleted": hid,
+    }), 200
+
+
+@app.route("/history", methods=["DELETE"])
+def history_clear():
+    cleared = 0
+    try:
+        with _history_lock:
+            if os.path.isdir(HISTORY_DIR):
+                for name in os.listdir(HISTORY_DIR):
+                    folder = _history_folder(name)
+                    if folder and os.path.isdir(folder):
+                        shutil.rmtree(folder)
+                        cleared += 1
+    except Exception as exc:
+        logger.warning(f"history: failed to clear history: {exc}", exc_info=True)
+    return jsonify({
+        "status": "success",
+        "cleared": cleared,
+    }), 200
+
+
 @app.route("/", methods=["GET"])
 @app.route("/ui", methods=["GET"])
 def browser_ui():
@@ -1194,6 +1465,12 @@ def browser_ui():
         '.hint{font-size:.72rem;color:#52525b;margin-top:.2rem}\n'
         '.tok-count{display:block;font-size:.7rem;color:#52525b;margin-top:.2rem;text-align:right}\n'
         '.tok-count.over{color:#f87171;font-weight:600}\n'
+        '#hist-list{max-height:420px;overflow-y:auto}\n'
+        '.hist-item{background:#111118;border:1px solid #2d2d40;border-radius:8px;padding:.75rem;margin-bottom:.65rem}\n'
+        '.hist-meta{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;font-size:.76rem;color:#71717a;margin-bottom:.35rem}\n'
+        '.hist-prompt{font-size:.82rem;color:#d4d4d8;margin-bottom:.5rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n'
+        '.hist-thumbs{display:flex;gap:.45rem;flex-wrap:wrap}\n'
+        '.hist-thumb{width:96px;height:96px;object-fit:cover;border-radius:6px;border:1px solid #2d2d40;cursor:pointer}\n'
         'hr{border:none;border-top:1px solid #1f1f2e;margin:.3rem 0 .7rem}\n'
         '</style>\n'
         '</head>\n'
@@ -1356,6 +1633,19 @@ def browser_ui():
         '  </div>\n'
         '  <div id="gen-imgs" class="img-grid"></div>\n'
 
+        '</div>\n'
+        '\n'
+        '<!-- 6. GET /history -->\n'
+        '<div class="card">\n'
+        '  <div class="card-header">\n'
+        '    <span class="method get">GET</span><span class="path">/history</span>\n'
+        '    <span class="desc">Recent server-side generation history</span>\n'
+        '  </div>\n'
+        '  <div class="controls">\n'
+        '    <button onclick="loadHistory()">Refresh</button>\n'
+        '    <button class="sec" onclick="clearHistory()">Clear all</button>\n'
+        '  </div>\n'
+        '  <div id="hist-list"></div>\n'
         '</div>\n'
         '\n'
         '<script>\n'
@@ -1612,6 +1902,7 @@ def browser_ui():
         '    _lastImgs=d.results||[];\n'
         '    renderImages(_lastImgs);\n'
         '    if(_lastImgs.some(x=>x.image_base64))show("btn-dl-all");\n'
+        '    if(d.state==="ready")loadHistory();\n'
         '  }catch(e){stopGeneratePoll();setGenerateActive(false);const el=document.getElementById("gen-err");el.textContent="Status poll failed: "+e;el.classList.remove("hidden");}\n'
         '}\n'
         'function renderImages(results){\n'
@@ -1651,9 +1942,47 @@ def browser_ui():
         '  });\n'
         '}\n'
         '\n'
+        '// ── 6. GET /history ───────────────────────────────────────────────\n'
+        'async function loadHistory(){\n'
+        '  const c=document.getElementById("hist-list");\n'
+        '  c.textContent="Loading history…";\n'
+        '  try{\n'
+        '    const r=await fetch(B+"/history");const d=await r.json();\n'
+        '    c.innerHTML="";\n'
+        '    const items=d.items||[];\n'
+        '    if(!items.length){c.innerHTML="<p class=\\"hint\\">No generation history yet.</p>";return;}\n'
+        '    items.forEach(item=>{\n'
+        '      const div=document.createElement("div");div.className="hist-item";\n'
+        '      const meta=document.createElement("div");meta.className="hist-meta";\n'
+        '      const when=item.created_at?new Date(item.created_at).toLocaleString():"unknown time";\n'
+        '      meta.appendChild(document.createTextNode(when+" · "+(item.device||"?")+" · "+(item.ok_count||0)+"/"+(item.image_count||0)+" ok"));\n'
+        '      const del=document.createElement("button");del.className="sec";del.textContent="Delete";del.onclick=function(){deleteHistory(item.id);};meta.appendChild(del);\n'
+        '      div.appendChild(meta);\n'
+        '      const first=(item.prompts&&item.prompts[0]&&item.prompts[0].prompt)||"";\n'
+        '      const p=document.createElement("div");p.className="hist-prompt";p.title=first;p.textContent=first.substring(0,140);div.appendChild(p);\n'
+        '      const thumbs=document.createElement("div");thumbs.className="hist-thumbs";\n'
+        '      (item.prompts||[]).forEach((pm,i)=>{\n'
+        '        if(pm.status==="ok"&&pm.filename){\n'
+        '          const src=B+"/history/"+encodeURIComponent(item.id)+"/image/"+i;\n'
+        '          const img=document.createElement("img");img.className="hist-thumb";img.src=src;img.alt=pm.prompt||"history image "+i;img.onclick=function(){window.open(src,"_blank");};thumbs.appendChild(img);\n'
+        '        }\n'
+        '      });\n'
+        '      div.appendChild(thumbs);c.appendChild(div);\n'
+        '    });\n'
+        '  }catch(e){c.innerHTML="<div class=\\"err-box\\">History failed: "+e+"</div>";}\n'
+        '}\n'
+        'async function deleteHistory(id){\n'
+        '  try{await fetch(B+"/history/"+encodeURIComponent(id),{method:"DELETE"});loadHistory();}catch(e){alert("Delete failed: "+e);}\n'
+        '}\n'
+        'async function clearHistory(){\n'
+        '  if(!confirm("Clear all generation history?"))return;\n'
+        '  try{await fetch(B+"/history",{method:"DELETE"});loadHistory();}catch(e){alert("Clear failed: "+e);}\n'
+        '}\n'
+        '\n'
         '// auto-fire health on load\n'
         'callHealth();\n'
         'callModelStatus();\n'
+        'loadHistory();\n'
         '</script>\n'
         '</body>\n'
         '</html>\n'
@@ -1679,7 +2008,12 @@ def root():
             "POST /generate/cancel": "Request cancellation of async generation",
             "GET /generate/status": "Poll async generation state: idle | in_progress | ready | error | cancelled",
             "POST /model/pull": "Start async model download/warm-up (returns 202)",
-            "GET /model/status": "Poll model warm-up state and cache presence"
+            "GET /model/status": "Poll model warm-up state and cache presence",
+            "GET /history": "List recent generation history (no inline image data)",
+            "GET /history/<hid>": "Read one generation history metadata record",
+            "GET /history/<hid>/image/<n>": "Download one persisted history image",
+            "DELETE /history/<hid>": "Delete one generation history item",
+            "DELETE /history": "Clear all generation history"
         },
         "documentation": "POST /generate with JSON batch config containing 'prompts' array"
     }), 200
