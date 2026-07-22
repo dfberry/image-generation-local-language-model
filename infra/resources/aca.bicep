@@ -8,7 +8,7 @@ param image string = ''                // Current running image, resolved by the
 param storageAccountName string = ''
 @secure()
 param storageAccountKey string = ''
-param workloadProfileName string = 'dedicated-d4'
+param workloadProfileName string = 'Consumption'
 
 // On first provision the real image hasn't been pushed to ACR yet (azd builds
 // and pushes during `azd deploy`, which runs AFTER `azd provision`). Use
@@ -28,8 +28,8 @@ var placeholderContainer = {
   image: 'python:3.11-slim'
   command: ['python3', '-m', 'http.server', '8000']
   resources: {
-    cpu: json('4')
-    memory: '16Gi'
+    cpu: json('1')
+    memory: '2Gi'
   }
   env: [
     {
@@ -49,7 +49,7 @@ var realContainer = {
   command: ['python3', 'app.py']
   resources: {
     cpu: json('4')
-    memory: '16Gi'
+    memory: '8Gi'
   }
   env: [
     {
@@ -158,8 +158,8 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
         }
       ] : []
       scale: {
-        // Dedicated workload profiles do not support scale-to-zero; minimum is 1
-        minReplicas: 1
+        // Consumption supports scale-to-zero.
+        minReplicas: 0
         maxReplicas: 1
       }
     }

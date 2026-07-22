@@ -96,8 +96,39 @@ def get_device(force_cpu: bool = False, verbose: bool = True) -> str:
 
 
 def get_dtype(device: str):
-    """Float16 on GPU, float32 on CPU."""
-    return torch.float16 if device in ("cuda", "mps") else torch.float32
+    """Float16 on GPU, configurable precision on CPU."""
+    if device in ("cuda", "mps"):
+        return torch.float16
+
+    # SDXL_CPU_DTYPE controls CPU precision; bf16 lowers RAM without fp16 CPU kernel gaps.
+    cpu_dtype = os.environ.get("SDXL_CPU_DTYPE", "bf16").strip().lower()
+    if cpu_dtype == "bf16":
+        return torch.bfloat16
+    if cpu_dtype == "fp32":
+        return torch.float32
+    if cpu_dtype == "fp16":
+        return torch.float16
+
+    print(f"⚠️  Unknown SDXL_CPU_DTYPE={cpu_dtype!r}; defaulting to bf16")
+    return torch.bfloat16
+
+
+def should_use_refiner(device: str) -> bool:
+    """Return whether the SDXL refiner is enabled for this device."""
+    # SDXL_USE_REFINER controls refiner loading; default is off on CPU, on for GPU/MPS.
+    value = os.environ.get("SDXL_USE_REFINER")
+    if value is None:
+        return device in ("cuda", "mps")
+
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes"):
+        return True
+    if normalized in ("0", "false", "no"):
+        return False
+
+    default = device in ("cuda", "mps")
+    print(f"⚠️  Unknown SDXL_USE_REFINER={normalized!r}; defaulting to {default}")
+    return default
 
 
 def get_base_model_local_dir() -> str:
@@ -150,6 +181,7 @@ def load_base(device: str) -> DiffusionPipeline:
         # keeps peak RAM in check.
         pipe.to("cpu")
         pipe.enable_attention_slicing()
+        pipe.enable_vae_slicing()
     else:
         pipe.to(device)
 
@@ -235,7 +267,11 @@ def generate(args, progress_callback=None, cancel_check=None) -> str:
 
     base = refiner = latents = text_encoder_2 = vae = image = None
     try:
-        if args.refine:
+        use_refiner = bool(args.refine) and should_use_refiner(device)
+        if args.refine and not use_refiner:
+            print("⚠️  Refiner disabled by SDXL_USE_REFINER/default; running base-only pipeline")
+
+        if use_refiner:
             print(f"🎨 Running base + refiner pipeline ({args.steps} steps total)...")
             base = load_base(device)
 

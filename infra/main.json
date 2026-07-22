@@ -1,11 +1,12 @@
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "languageVersion": "2.0",
   "contentVersion": "1.0.0.0",
   "metadata": {
     "_generator": {
       "name": "bicep",
       "version": "0.42.1.51946",
-      "templateHash": "11010461599692290384"
+      "templateHash": "11359022174507958300"
     }
   },
   "parameters": {
@@ -32,13 +33,17 @@
     "apiExists": {
       "type": "bool",
       "defaultValue": false
+    },
+    "modelStorageAccountName": {
+      "type": "string",
+      "defaultValue": "[format('sdxlmodels{0}', uniqueString(resourceGroup().id))]"
     }
   },
   "variables": {
     "acrUrl": "[if(not(empty(parameters('containerRegistryUrl'))), parameters('containerRegistryUrl'), format('{0}.azurecr.io', parameters('containerRegistryName')))]"
   },
-  "resources": [
-    {
+  "resources": {
+    "identity": {
       "type": "Microsoft.Resources/deployments",
       "apiVersion": "2025-04-01",
       "name": "identity-deployment",
@@ -99,7 +104,7 @@
         }
       }
     },
-    {
+    "acr": {
       "type": "Microsoft.Resources/deployments",
       "apiVersion": "2025-04-01",
       "name": "acr-deployment",
@@ -116,7 +121,7 @@
             "value": "[parameters('containerRegistryName')]"
           },
           "uamiPrincipalId": {
-            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'identity-deployment'), '2025-04-01').outputs.principalId.value]"
+            "value": "[reference('identity').outputs.principalId.value]"
           }
         },
         "template": {
@@ -190,10 +195,10 @@
         }
       },
       "dependsOn": [
-        "[resourceId('Microsoft.Resources/deployments', 'identity-deployment')]"
+        "identity"
       ]
     },
-    {
+    "caEnvironment": {
       "type": "Microsoft.Resources/deployments",
       "apiVersion": "2025-04-01",
       "name": "aca-env-deployment",
@@ -217,7 +222,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.42.1.51946",
-              "templateHash": "7233958165951272694"
+              "templateHash": "17422441222573156072"
             }
           },
           "parameters": {
@@ -259,12 +264,6 @@
                   {
                     "name": "Consumption",
                     "workloadProfileType": "Consumption"
-                  },
-                  {
-                    "name": "dedicated-d4",
-                    "workloadProfileType": "D4",
-                    "minimumCount": 1,
-                    "maximumCount": 2
                   }
                 ]
               },
@@ -290,7 +289,232 @@
         }
       }
     },
-    {
+    "storage": {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "storage-deployment",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "storageAccountName": {
+            "value": "[parameters('modelStorageAccountName')]"
+          },
+          "environmentName": {
+            "value": "[parameters('environmentName')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "languageVersion": "2.0",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.42.1.51946",
+              "templateHash": "2523095845177279212"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "defaultValue": "[resourceGroup().location]"
+            },
+            "storageAccountName": {
+              "type": "string"
+            },
+            "environmentName": {
+              "type": "string"
+            },
+            "fileShareName": {
+              "type": "string",
+              "defaultValue": "models"
+            },
+            "storageName": {
+              "type": "string",
+              "defaultValue": "models-storage"
+            },
+            "shareQuotaGb": {
+              "type": "int",
+              "defaultValue": 100
+            },
+            "historyShareName": {
+              "type": "string",
+              "defaultValue": "history"
+            },
+            "historyStorageName": {
+              "type": "string",
+              "defaultValue": "history-storage"
+            },
+            "historyShareQuotaGb": {
+              "type": "int",
+              "defaultValue": 50
+            }
+          },
+          "resources": {
+            "storage": {
+              "type": "Microsoft.Storage/storageAccounts",
+              "apiVersion": "2023-01-01",
+              "name": "[parameters('storageAccountName')]",
+              "location": "[parameters('location')]",
+              "sku": {
+                "name": "Standard_LRS"
+              },
+              "kind": "StorageV2",
+              "properties": {
+                "minimumTlsVersion": "TLS1_2",
+                "allowBlobPublicAccess": false,
+                "largeFileSharesState": "Enabled"
+              }
+            },
+            "fileService": {
+              "type": "Microsoft.Storage/storageAccounts/fileServices",
+              "apiVersion": "2023-01-01",
+              "name": "[format('{0}/{1}', parameters('storageAccountName'), 'default')]",
+              "dependsOn": [
+                "storage"
+              ]
+            },
+            "share": {
+              "type": "Microsoft.Storage/storageAccounts/fileServices/shares",
+              "apiVersion": "2023-01-01",
+              "name": "[format('{0}/{1}/{2}', parameters('storageAccountName'), 'default', parameters('fileShareName'))]",
+              "properties": {
+                "shareQuota": "[parameters('shareQuotaGb')]",
+                "enabledProtocols": "SMB"
+              },
+              "dependsOn": [
+                "fileService"
+              ]
+            },
+            "historyShare": {
+              "type": "Microsoft.Storage/storageAccounts/fileServices/shares",
+              "apiVersion": "2023-01-01",
+              "name": "[format('{0}/{1}/{2}', parameters('storageAccountName'), 'default', parameters('historyShareName'))]",
+              "properties": {
+                "shareQuota": "[parameters('historyShareQuotaGb')]",
+                "enabledProtocols": "SMB"
+              },
+              "dependsOn": [
+                "fileService"
+              ]
+            },
+            "environment": {
+              "existing": true,
+              "type": "Microsoft.App/managedEnvironments",
+              "apiVersion": "2023-05-01",
+              "name": "[parameters('environmentName')]"
+            },
+            "environmentStorage": {
+              "type": "Microsoft.App/managedEnvironments/storages",
+              "apiVersion": "2023-05-01",
+              "name": "[format('{0}/{1}', parameters('environmentName'), parameters('storageName'))]",
+              "properties": {
+                "azureFile": {
+                  "accountName": "[parameters('storageAccountName')]",
+                  "accountKey": "[listKeys('storage', '2023-01-01').keys[0].value]",
+                  "shareName": "[parameters('fileShareName')]",
+                  "accessMode": "ReadWrite"
+                }
+              },
+              "dependsOn": [
+                "share",
+                "storage"
+              ]
+            },
+            "environmentHistoryStorage": {
+              "type": "Microsoft.App/managedEnvironments/storages",
+              "apiVersion": "2023-05-01",
+              "name": "[format('{0}/{1}', parameters('environmentName'), parameters('historyStorageName'))]",
+              "properties": {
+                "azureFile": {
+                  "accountName": "[parameters('storageAccountName')]",
+                  "accountKey": "[listKeys('storage', '2023-01-01').keys[0].value]",
+                  "shareName": "[parameters('historyShareName')]",
+                  "accessMode": "ReadWrite"
+                }
+              },
+              "dependsOn": [
+                "historyShare",
+                "storage"
+              ]
+            }
+          },
+          "outputs": {
+            "storageAccountName": {
+              "type": "string",
+              "value": "[parameters('storageAccountName')]"
+            },
+            "storageName": {
+              "type": "string",
+              "value": "[parameters('storageName')]"
+            },
+            "historyStorageName": {
+              "type": "string",
+              "value": "[parameters('historyStorageName')]"
+            },
+            "storageAccountKey": {
+              "type": "securestring",
+              "value": "[listKeys('storage', '2023-01-01').keys[0].value]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "caEnvironment"
+      ]
+    },
+    "fetchImage": {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "fetch-image-deployment",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "exists": {
+            "value": "[parameters('apiExists')]"
+          },
+          "name": {
+            "value": "[parameters('containerAppName')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.42.1.51946",
+              "templateHash": "3810904069505196281"
+            }
+          },
+          "parameters": {
+            "exists": {
+              "type": "bool"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "resources": [],
+          "outputs": {
+            "image": {
+              "type": "string",
+              "value": "[if(parameters('exists'), coalesce(reference(resourceId('Microsoft.App/containerApps', parameters('name')), '2023-05-01').template.containers[0].image, ''), '')]"
+            }
+          }
+        }
+      }
+    },
+    "containerApp": {
       "type": "Microsoft.Resources/deployments",
       "apiVersion": "2025-04-01",
       "name": "container-app-deployment",
@@ -307,16 +531,25 @@
             "value": "[parameters('containerAppName')]"
           },
           "containerAppsEnvironmentId": {
-            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'aca-env-deployment'), '2025-04-01').outputs.environmentId.value]"
+            "value": "[reference('caEnvironment').outputs.environmentId.value]"
           },
           "containerRegistryUrl": {
             "value": "[variables('acrUrl')]"
           },
           "uamiId": {
-            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'identity-deployment'), '2025-04-01').outputs.identityId.value]"
+            "value": "[reference('identity').outputs.identityId.value]"
           },
           "exists": {
             "value": "[parameters('apiExists')]"
+          },
+          "image": {
+            "value": "[reference('fetchImage').outputs.image.value]"
+          },
+          "storageAccountName": {
+            "value": "[reference('storage').outputs.storageAccountName.value]"
+          },
+          "storageAccountKey": {
+            "value": "[listOutputsWithSecureValues('storage', '2025-04-01').storageAccountKey]"
           }
         },
         "template": {
@@ -326,7 +559,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.42.1.51946",
-              "templateHash": "10976057984586231710"
+              "templateHash": "15517449458826174401"
             }
           },
           "parameters": {
@@ -350,6 +583,10 @@
               "type": "bool",
               "defaultValue": false
             },
+            "image": {
+              "type": "string",
+              "defaultValue": ""
+            },
             "storageAccountName": {
               "type": "string",
               "defaultValue": ""
@@ -360,10 +597,11 @@
             },
             "workloadProfileName": {
               "type": "string",
-              "defaultValue": "dedicated-d4"
+              "defaultValue": "Consumption"
             }
           },
           "variables": {
+            "realImage": "[if(not(empty(parameters('image'))), parameters('image'), 'python:3.11-slim')]",
             "placeholderContainer": {
               "name": "sdxl-api",
               "image": "python:3.11-slim",
@@ -374,8 +612,8 @@
                 "8000"
               ],
               "resources": {
-                "cpu": "[json('4')]",
-                "memory": "16Gi"
+                "cpu": "[json('1')]",
+                "memory": "2Gi"
               },
               "env": [
                 {
@@ -384,6 +622,59 @@
                 }
               ],
               "probes": []
+            },
+            "realContainer": {
+              "name": "sdxl-api",
+              "image": "[variables('realImage')]",
+              "command": [
+                "python3",
+                "app.py"
+              ],
+              "resources": {
+                "cpu": "[json('4')]",
+                "memory": "8Gi"
+              },
+              "env": [
+                {
+                  "name": "PORT",
+                  "value": "8000"
+                },
+                {
+                  "name": "HISTORY_DIR",
+                  "value": "/app/history"
+                }
+              ],
+              "volumeMounts": "[if(not(empty(parameters('storageAccountName'))), createArray(createObject('volumeName', 'models-cache', 'mountPath', '/root/.cache/huggingface'), createObject('volumeName', 'history-cache', 'mountPath', '/app/history')), createArray())]",
+              "probes": [
+                {
+                  "type": "Startup",
+                  "httpGet": {
+                    "path": "/health",
+                    "port": 8000
+                  },
+                  "initialDelaySeconds": 10,
+                  "periodSeconds": 10,
+                  "failureThreshold": 30
+                },
+                {
+                  "type": "Liveness",
+                  "httpGet": {
+                    "path": "/health",
+                    "port": 8000
+                  },
+                  "initialDelaySeconds": 60,
+                  "periodSeconds": 30
+                },
+                {
+                  "type": "Readiness",
+                  "httpGet": {
+                    "path": "/health",
+                    "port": 8000
+                  },
+                  "initialDelaySeconds": 30,
+                  "periodSeconds": 10
+                }
+              ]
             }
           },
           "resources": [
@@ -421,11 +712,11 @@
                 },
                 "template": {
                   "containers": [
-                    "[if(parameters('exists'), createObject('name', 'sdxl-api', 'image', if(parameters('exists'), coalesce(reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2023-05-01').template.containers[0].image, 'python:3.11-slim'), 'python:3.11-slim'), 'command', createArray('python3', 'app.py'), 'resources', createObject('cpu', json('4'), 'memory', '16Gi'), 'env', createArray(createObject('name', 'PORT', 'value', '8000')), 'volumeMounts', if(not(empty(parameters('storageAccountName'))), createArray(createObject('volumeName', 'models-cache', 'mountPath', '/root/.cache/huggingface')), createArray()), 'probes', createArray(createObject('type', 'Startup', 'httpGet', createObject('path', '/health', 'port', 8000), 'initialDelaySeconds', 10, 'periodSeconds', 10, 'failureThreshold', 30), createObject('type', 'Liveness', 'httpGet', createObject('path', '/health', 'port', 8000), 'initialDelaySeconds', 60, 'periodSeconds', 30), createObject('type', 'Readiness', 'httpGet', createObject('path', '/health', 'port', 8000), 'initialDelaySeconds', 30, 'periodSeconds', 10))), variables('placeholderContainer'))]"
+                    "[if(parameters('exists'), variables('realContainer'), variables('placeholderContainer'))]"
                   ],
-                  "volumes": "[if(not(empty(parameters('storageAccountName'))), createArray(createObject('name', 'models-cache', 'storageType', 'AzureFile', 'storageName', 'models-storage')), createArray())]",
+                  "volumes": "[if(not(empty(parameters('storageAccountName'))), createArray(createObject('name', 'models-cache', 'storageType', 'AzureFile', 'storageName', 'models-storage'), createObject('name', 'history-cache', 'storageType', 'AzureFile', 'storageName', 'history-storage')), createArray())]",
                   "scale": {
-                    "minReplicas": 1,
+                    "minReplicas": 0,
                     "maxReplicas": 1
                   }
                 }
@@ -449,27 +740,33 @@
         }
       },
       "dependsOn": [
-        "[resourceId('Microsoft.Resources/deployments', 'aca-env-deployment')]",
-        "[resourceId('Microsoft.Resources/deployments', 'identity-deployment')]"
+        "caEnvironment",
+        "fetchImage",
+        "identity",
+        "storage"
       ]
     }
-  ],
+  },
   "outputs": {
     "AZURE_CONTAINER_REGISTRY_ENDPOINT": {
       "type": "string",
-      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'acr-deployment'), '2025-04-01').outputs.loginServer.value]"
+      "value": "[reference('acr').outputs.loginServer.value]"
     },
     "containerAppUrl": {
       "type": "string",
-      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'container-app-deployment'), '2025-04-01').outputs.fqdn.value]"
+      "value": "[reference('containerApp').outputs.fqdn.value]"
     },
     "containerAppName": {
       "type": "string",
-      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'container-app-deployment'), '2025-04-01').outputs.containerAppName.value]"
+      "value": "[reference('containerApp').outputs.containerAppName.value]"
     },
     "environmentId": {
       "type": "string",
-      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'aca-env-deployment'), '2025-04-01').outputs.environmentId.value]"
+      "value": "[reference('caEnvironment').outputs.environmentId.value]"
+    },
+    "modelStorageAccountName": {
+      "type": "string",
+      "value": "[reference('storage').outputs.storageAccountName.value]"
     }
   }
 }
