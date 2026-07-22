@@ -36,7 +36,7 @@ module acr 'resources/acr.bicep' = {
   }
 }
 
-// Container Apps Environment (with Dedicated D4 workload profile)
+// Container Apps Environment (Consumption workload profile)
 module caEnvironment 'resources/aca-env.bicep' = {
   name: 'aca-env-deployment'
   params: {

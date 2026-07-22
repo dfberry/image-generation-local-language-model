@@ -127,7 +127,7 @@ What happens:
 2. `azd provision` — deploys:
    - UAMI
    - ACR (with AcrPull role for UAMI)
-   - Log Analytics + ACA Environment (Dedicated D4 workload profile)
+   - Log Analytics + ACA Environment (Consumption workload profile)
    - Container App (`apiExists=false` → placeholder image, no probes)
 3. `azd deploy` — pushes real image to ACR, calls `az containerapp update --image <acr>/<tag>`
 4. `azd provision` — re-runs bicep with `apiExists=true`, reads the real running image, and explicitly sets `command: ['python3', 'app.py']` so Flask serves the app.
@@ -148,15 +148,15 @@ On re-provision: `apiExists=true` → bicep reads current image from running app
 azd down --purge
 ```
 
-Note: the Dedicated D4 profile always keeps **1 node running** — see Cost note below.
+Note: the Consumption profile can scale to zero when idle.
 
 ---
 
 ## Cost / Teardown Note
 
-The Dedicated D4 workload profile (`minimumCount: 1`) means **one D4 node is always running**, even when no requests come in. D4 = 4 vCPU / 16 GB RAM. In East US 2 this is approximately **$0.50–0.70/hour** (billed per-second). There is no scale-to-zero option on Dedicated profiles.
+The Container App uses the Consumption workload profile with `minReplicas: 0`, so the app can scale to zero when idle. CPU and memory are billed while replicas are running.
 
-**Run `azd down --purge` when not using the environment** to avoid ongoing charges. `--purge` ensures the ACR and Log Analytics workspace are fully deleted rather than soft-deleted.
+**Run `azd down --purge` when done with the environment** to remove supporting resources such as ACR and Log Analytics. `--purge` ensures the ACR and Log Analytics workspace are fully deleted rather than soft-deleted.
 
 ACR name is `sdxlregistry${uniqueString(resourceGroup().id)}` — deterministic per resource group, so it will not conflict across environments or re-creates of the same RG.
 
@@ -166,22 +166,9 @@ ACR name is `sdxlregistry${uniqueString(resourceGroup().id)}` — deterministic 
 
 These two issues were only visible at actual deploy runtime — bicep validation and preflight checks cannot catch them.
 
-### RF-1 — Workload-profile node-count deadlock
+### RF-1 — Consumption profile scheduling
 
-**Symptom:** Repeated system events: `"The workload profile has reached its maximum node count. Please increase maximum node count."` + `AssigningReplicaFailed` / `Waiting for infrastructure to be ready`. The container app would never transition from the placeholder revision to the real revision.
-
-**Root cause:** `dedicated-d4` profile was `minimumCount: 1, maximumCount: 1` — exactly one D4 node ever. Each D4 node holds exactly one container (4 vCPU / 16 Gi per container = one full node). During a rolling revision handoff, ACA starts the NEW revision's replica before retiring the old one:
-
-```
-Node 1: placeholder revision (still Running) ← occupying the only node
-Node ?:  real (azd-…) revision              ← no node available → never starts
-```
-
-In Single revision mode ACA won't retire the placeholder until the new revision is healthy. But the new revision can't start without a free node. **Permanent deadlock.**
-
-**Live hotfix applied (2026-07-05):** `az containerapp env workload-profile update --name sdxl-env --resource-group rg-diberry-image3 --profile-name dedicated-d4 --max-nodes 2`
-
-**Durable fix (`aca-env.bicep`):** `maximumCount: 2` — two D4 nodes. The transient overlap of old + new revision during every rolling update now has room.
+The app now uses the Consumption workload profile with a single replica max and scale-to-zero. Keep container resources within the Consumption limit of 4 vCPU / 8 Gi per replica so revisions can schedule reliably.
 
 ---
 

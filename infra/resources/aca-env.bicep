@@ -23,23 +23,11 @@ resource containerAppsEnvironment 'Microsoft.App/managedEnvironments@2023-05-01'
         sharedKey: logAnalyticsWorkspace.listKeys().primarySharedKey
       }
     }
-    // Workload profiles required to host containers with > 2 vCPU / 4 Gi (SDXL needs 4 vCPU / 16 Gi).
-    // Consumption profile is included alongside dedicated so other apps can still use the env.
-    // D4: 4 vCPU / 16 Gi per node; minimumCount 1 keeps the node warm (dedicated cannot scale to 0).
+    // Consumption hosts the app with scale-to-zero (max 4 vCPU / 8 Gi per replica).
     workloadProfiles: [
       {
         name: 'Consumption'
         workloadProfileType: 'Consumption'
-      }
-      {
-        name: 'dedicated-d4'
-        workloadProfileType: 'D4'
-        minimumCount: 1
-        // maximumCount 2: rolling updates need two nodes briefly — old revision holds
-        // the single node while the new revision is being scheduled. With max=1 the new
-        // revision can never start (deadlock). Two nodes breaks that deadlock.
-        // Live hotfix already applied via az containerapp env workload-profile update.
-        maximumCount: 2
       }
     ]
   }
